@@ -1,0 +1,1351 @@
+#comprehensive solution for automating role creation in SailPoint by ingesting XML files 
+#from your external role modeling team:
+
+#[External Role Modeling Tool] 
+#        ↓ (generates XML)
+#[XML Files in Landing Zone]
+#        ↓ (File Watcher/Scheduled Task)
+#[SailPoint Import Process]
+#        ↓ (Validation & Transformation)
+#[Role Creation/Update in IIQ]
+
+# Role example
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE Bundle PUBLIC "sailpoint.dtd" "sailpoint.dtd">
+<Bundle name="BANK_ROLE_TREASURY_ANALYST" type="business" riskScoreWeight="8">
+  <Attributes>
+    <Map>
+      <entry key="externalId" value="EXT-2024-001"/>
+      <entry key="modelingTool" value="BankRoleModeler"/>
+      <entry key="modeledDate" value="2024-01-15"/>
+      <entry key="businessOwner" value="John.Smith"/>
+      <entry key="riskLevel" value="Medium"/>
+      <entry key="complianceFlags" value="SOX,PCI"/>
+    </Map>
+  </Attributes>
+  <Description>Treasury Analyst with access to payment systems</Description>
+  <Owner>
+    <Reference class="sailpoint.object.Identity" name="John.Smith"/>
+  </Owner>
+  <Profiles>
+    <Reference class="sailpoint.object.Bundle" name="IT_ROLE_PAYMENT_SYSTEM_READ"/>
+    <Reference class="sailpoint.object.Bundle" name="IT_ROLE_TREASURY_REPORTS"/>
+  </Profiles>
+  <Requirements>
+    <Filter operation="AND">
+      <Filter operation="EQ" property="department" value="Treasury"/>
+      <Filter operation="IN" property="jobTitle">
+        <Value>
+          <List>
+            <String>Treasury Analyst</String>
+            <String>Senior Treasury Analyst</String>
+          </List>
+        </Value>
+      </Filter>
+    </Filter>
+  </Requirements>
+</Bundle>
+# Step 2: Import Task Configuration
+<TaskDefinition name="Import External Role Models" 
+                resultRenderer="progressRenderer.xhtml"
+                executor="sailpoint.task.RoleImporter"
+                type="System">
+  <Description>Import roles from external modeling system</Description>
+  <Attributes>
+    <Map>
+      <entry key="importDirectory" value="/opt/sailpoint/role-imports/inbox"/>
+      <entry key="archiveDirectory" value="/opt/sailpoint/role-imports/archive"/>
+      <entry key="errorDirectory" value="/opt/sailpoint/role-imports/errors"/>
+      <entry key="preProcessRule" value="Validate External Role XML"/>
+      <entry key="postProcessRule" value="Post Process Imported Roles"/>
+      <entry key="sendNotification" value="true"/>
+      <entry key="notificationEmail" value="role-admin@bank.com"/>
+    </Map>
+  </Attributes>
+</TaskDefinition>
+
+#Step 3 - Preprocess validation rule
+
+
+import java.io.File;
+import java.util.HashMap;
+import java.util.Map;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import sailpoint.object.Bundle;
+import sailpoint.object.Identity;
+import sailpoint.tools.Message;
+
+public class ValidateExternalRoleXML {
+    
+    public Map validateAndTransform(File xmlFile, Map context) throws Exception {
+        Map<String, Object> result = new HashMap<>();
+        List<Message> messages = new ArrayList<>();
+        boolean isValid = true;
+        
+        try {
+            // Parse XML
+            DocumentBuilderFactory dbFactory = DocumentBuilderFactory.newInstance();
+            DocumentBuilder dBuilder = dbFactory.newDocumentBuilder();
+            Document doc = dBuilder.parse(xmlFile);
+            doc.getDocumentElement().normalize();
+            
+            Element roleElement = doc.getDocumentElement();
+            String roleName = roleElement.getAttribute("name");
+            
+            // Validation checks
+            if (!roleName.startsWith("BANK_ROLE_")) {
+                messages.add(Message.error("Role name must start with BANK_ROLE_: " + roleName));
+                isValid = false;
+            }
+            
+            // Check if role already exists
+            Bundle existingRole = context.getObjectByName(Bundle.class, roleName);
+            if (existingRole != null) {
+                String externalId = roleElement.getElementsByTagName("entry")
+                    .item(0).getAttribute("value");
+                
+                // Check if external ID matches
+                if (!externalId.equals(existingRole.getAttribute("externalId"))) {
+                    messages.add(Message.warn("Role exists with different external ID"));
+                }
+                result.put("isUpdate", true);
+            }
+            
+            // Validate owner exists
+            String ownerName = extractOwner(roleElement);
+            Identity owner = context.getObjectByName(Identity.class, ownerName);
+            if (owner == null) {
+                messages.add(Message.error("Owner not found: " + ownerName));
+                isValid = false;
+            }
+            
+            // Check IT roles exist
+            NodeList profiles = roleElement.getElementsByTagName("Reference");
+            for (int i = 0; i < profiles.getLength(); i++) {
+                Element profile = (Element) profiles.item(i);
+                String itRoleName = profile.getAttribute("name");
+                Bundle itRole = context.getObjectByName(Bundle.class, itRoleName);
+                if (itRole == null) {
+                    messages.add(Message.error("IT Role not found: " + itRoleName));
+                    isValid = false;
+                }
+            }
+            
+            // Add compliance validation
+            if (roleName.contains("PAYMENT") || roleName.contains("TREASURY")) {
+                String complianceFlags = extractAttribute(roleElement, "complianceFlags");
+                if (complianceFlags == null || !complianceFlags.contains("SOX")) {
+                    messages.add(Message.warn("Payment/Treasury roles should have SOX compliance flag"));
+                }
+            }
+            
+        } catch (Exception e) {
+            messages.add(Message.error("XML parsing error: " + e.getMessage()));
+            isValid = false;
+        }
+        
+        result.put("isValid", isValid);
+        result.put("messages", messages);
+        return result;
+    }
+}
+
+
+# Role Import Rule
+
+import sailpoint.object.Bundle;
+import sailpoint.object.Filter;
+import sailpoint.api.SailPointContext;
+import sailpoint.tools.xml.XMLObjectFactory;
+import java.io.File;
+import java.util.Date;
+
+public class RoleImportRule {
+    
+    public void importRole(SailPointContext context, File xmlFile, Map options) 
+            throws Exception {
+        
+        log.info("Importing role from: " + xmlFile.getName());
+        
+        // Parse the XML into a Bundle object
+        XMLObjectFactory xmlFactory = XMLObjectFactory.getInstance();
+        Bundle role = (Bundle) xmlFactory.parseXml(context, xmlFile, true);
+        
+        // Enrich with additional metadata
+        role.setAttribute("importDate", new Date());
+        role.setAttribute("importSource", "External Role Modeler");
+        role.setAttribute("importFile", xmlFile.getName());
+        
+        // Set elevated access based on risk level
+        String riskLevel = (String) role.getAttribute("riskLevel");
+        if ("High".equals(riskLevel) || "Critical".equals(riskLevel)) {
+            role.setHighRisk(true);
+        }
+        
+        // Handle role type classification
+        classifyRole(role);
+        
+        // Check for existing role
+        Bundle existingRole = context.getObjectByName(Bundle.class, role.getName());
+        if (existingRole != null) {
+            // Merge logic
+            mergeRoles(existingRole, role);
+            context.saveObject(existingRole);
+            log.info("Updated existing role: " + role.getName());
+        } else {
+            // New role
+            context.saveObject(role);
+            log.info("Created new role: " + role.getName());
+        }
+        
+        context.commitTransaction();
+    }
+    
+    private void classifyRole(Bundle role) {
+        String roleName = role.getName();
+        
+        // Auto-classify based on naming convention
+        if (roleName.contains("ADMIN") || roleName.contains("SUPER")) {
+            role.setAttribute("roleCategory", "Privileged");
+            role.setHighRisk(true);
+        } else if (roleName.contains("READ_ONLY") || roleName.contains("VIEWER")) {
+            role.setAttribute("roleCategory", "ReadOnly");
+        } else if (roleName.contains("APPROVER") || roleName.contains("MANAGER")) {
+            role.setAttribute("roleCategory", "Approval");
+        } else {
+            role.setAttribute("roleCategory", "Standard");
+        }
+    }
+    
+    private void mergeRoles(Bundle existing, Bundle newRole) {
+        // Preserve certain attributes from existing role
+        newRole.setAttribute("createdDate", existing.getAttribute("createdDate"));
+        newRole.setAttribute("lastCertificationDate", 
+                           existing.getAttribute("lastCertificationDate"));
+        
+        // Update version
+        Integer version = (Integer) existing.getAttribute("version");
+        newRole.setAttribute("version", version != null ? version + 1 : 1);
+        
+        // Copy all attributes from new role to existing
+        existing.setAttributes(newRole.getAttributes());
+        existing.setProfiles(newRole.getProfiles());
+        existing.setSelector(newRole.getSelector());
+        existing.setDescription(newRole.getDescription());
+        existing.setOwner(newRole.getOwner());
+    }
+}
+#Step 5 Post-processing rule
+
+import sailpoint.object.Bundle;
+import sailpoint.object.TaskResult;
+import sailpoint.object.EmailOptions;
+import sailpoint.object.EmailTemplate;
+
+public class PostProcessImportedRoles {
+    
+    public void execute(SailPointContext context, TaskResult taskResult, 
+                       List<String> processedRoles) throws Exception {
+        
+        StringBuilder report = new StringBuilder();
+        report.append("Role Import Summary\n");
+        report.append("==================\n\n");
+        
+        int newRoles = 0;
+        int updatedRoles = 0;
+        int errors = 0;
+        
+        for (String roleName : processedRoles) {
+            Bundle role = context.getObjectByName(Bundle.class, roleName);
+            if (role != null) {
+                // Trigger initial certification for new high-risk roles
+                if (role.isHighRisk() && 
+                    role.getAttribute("importDate").equals(role.getAttribute("createdDate"))) {
+                    scheduleInitialCertification(context, role);
+                    newRoles++;
+                } else {
+                    updatedRoles++;
+                }
+                
+                // Add to access review campaigns if needed
+                if (role.getAttribute("complianceFlags") != null) {
+                    addToComplianceCampaigns(context, role);
+                }
+                
+                report.append("✓ " + roleName + " - " + role.getAttribute("riskLevel") + "\n");
+            } else {
+                errors++;
+                report.append("✗ " + roleName + " - Import failed\n");
+            }
+        }
+        
+        report.append("\n\nSummary:");
+        report.append("\n- New Roles: " + newRoles);
+        report.append("\n- Updated Roles: " + updatedRoles);
+        report.append("\n- Errors: " + errors);
+        
+        // Send notification
+        sendImportReport(context, report.toString());
+        
+        // Update task result
+        taskResult.setAttribute("newRoles", newRoles);
+        taskResult.setAttribute("updatedRoles", updatedRoles);
+        taskResult.setAttribute("errors", errors);
+    }
+    
+    private void scheduleInitialCertification(SailPointContext context, Bundle role) {
+        // Create certification campaign for new high-risk role
+        log.info("Scheduling initial certification for: " + role.getName());
+        // Implementation details...
+    }
+}
+# Step 6 File watcher script
+
+#!/bin/bash
+# role-watcher.sh
+
+INBOX_DIR="/opt/sailpoint/role-imports/inbox"
+PROCESSING_DIR="/opt/sailpoint/role-imports/processing"
+IIQ_CONSOLE="/opt/sailpoint/iiq/bin/iiq console"
+
+inotifywait -m "$INBOX_DIR" -e create -e moved_to |
+    while read path action file; do
+        if [[ "$file" =~ .*\.xml$ ]]; then
+            echo "Processing role file: $file"
+            mv "$INBOX_DIR/$file" "$PROCESSING_DIR/"
+            
+            # Trigger SailPoint task
+            $IIQ_CONSOLE <<EOF
+import sailpoint.object.TaskDefinition;
+import sailpoint.object.TaskResult;
+import sailpoint.api.TaskManager;
+
+TaskDefinition taskDef = context.getObjectByName(TaskDefinition.class, 
+                                                 "Import External Role Models");
+TaskManager tm = new TaskManager(context);
+TaskResult result = tm.runSync(taskDef, new HashMap());
+System.out.println("Task completed: " + result.isSuccess());
+EOF
+        fi
+    done
+
+#Step 7 - Create a Service account
+
+<Identity name="svc-role-modeler">
+  <Attributes>
+    <Map>
+      <entry key="systemAccount" value="true"/>
+      <entry key="capabilities">
+        <value>
+          <List>
+            <String>RoleAdministrator</String>
+          </List>
+        </value>
+      </entry>
+    </Map>
+  </Attributes>
+</Identity>
+
+
+#Step 7.1 - Audit Event (optional)
+
+import sailpoint.object.AuditEvent;
+
+AuditEvent event = new AuditEvent();
+event.setAction("RoleImport");
+event.setSource("External Role Modeler");
+event.setTarget(role.getName());
+event.setAttribute("externalId", role.getAttribute("externalId"));
+context.saveObject(event);
+
+# Save into database
+
+#Database table design
+
+-- Main table for role XML documents
+CREATE TABLE ROLE_IMPORT_QUEUE (
+    ID                  VARCHAR(128) PRIMARY KEY,
+    ROLE_NAME          VARCHAR(255) NOT NULL,
+    EXTERNAL_ID        VARCHAR(128) UNIQUE NOT NULL,
+    XML_CONTENT        CLOB NOT NULL,
+    STATUS             VARCHAR(50) DEFAULT 'PENDING',
+    CREATED_DATE       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CREATED_BY         VARCHAR(128),
+    PROCESSED_DATE     TIMESTAMP,
+    PROCESSED_BY       VARCHAR(128),
+    ERROR_MESSAGE      VARCHAR(4000),
+    RETRY_COUNT        INT DEFAULT 0,
+    VERSION            INT DEFAULT 1,
+    CHECKSUM           VARCHAR(64),
+    SOURCE_SYSTEM      VARCHAR(128) DEFAULT 'External Role Modeler'
+);
+
+-- Status tracking table
+CREATE TABLE ROLE_IMPORT_STATUS (
+    ID                  VARCHAR(128) PRIMARY KEY,
+    IMPORT_ID          VARCHAR(128) REFERENCES ROLE_IMPORT_QUEUE(ID),
+    STATUS             VARCHAR(50),
+    STATUS_DATE        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    MESSAGE            VARCHAR(4000),
+    DETAILS            CLOB
+);
+
+-- Archive table for processed records
+CREATE TABLE ROLE_IMPORT_ARCHIVE (
+    -- Same structure as ROLE_IMPORT_QUEUE
+    -- Plus:
+    ARCHIVE_DATE       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ARCHIVE_REASON     VARCHAR(255)
+);
+
+-- Indexes for performance
+CREATE INDEX IDX_RIQ_STATUS ON ROLE_IMPORT_QUEUE(STATUS);
+CREATE INDEX IDX_RIQ_CREATED ON ROLE_IMPORT_QUEUE(CREATED_DATE);
+CREATE INDEX IDX_RIQ_EXTERNAL_ID ON ROLE_IMPORT_QUEUE(EXTERNAL_ID);
+
+
+#Step 1 Database Connection Configuration
+
+<!-- In SystemConfiguration or as Application -->
+<Application name="RoleImportDB" type="JDBC">
+  <Attributes>
+    <Map>
+      <entry key="url" value="jdbc:oracle:thin:@roledb.bank.com:1521:ROLEDB"/>
+      <entry key="user" value="role_import_user"/>
+      <entry key="password" value="encrypted:AES:7H1s1s3nCryPt3d=="/>
+      <entry key="driverClass" value="oracle.jdbc.driver.OracleDriver"/>
+      <entry key="maxPoolSize" value="10"/>
+      <entry key="minPoolSize" value="2"/>
+    </Map>
+  </Attributes>
+</Application>
+
+#Step2 scheduled task definition
+
+<TaskDefinition name="Process Role Import Queue" 
+                executor="sailpoint.task.generic.GenericTaskExecutor"
+                type="System"
+                template="true">
+  <Description>Process role XMLs from database queue</Description>
+  <Attributes>
+    <Map>
+      <entry key="ruleRunner" value="Process Role Import Queue Rule"/>
+      <entry key="batchSize" value="50"/>
+      <entry key="processArchived" value="false"/>
+      <entry key="retryFailures" value="true"/>
+      <entry key="maxRetries" value="3"/>
+      <entry key="runAsUser" value="spadmin"/>
+    </Map>
+  </Attributes>
+  <Triggers>
+    <!-- Run every 5 minutes -->
+    <Trigger type="IntervalTrigger" interval="300000"/>
+  </Triggers>
+</TaskDefinition>
+
+#Step 3 - Main Processing Rule
+
+import java.sql.*;
+import java.io.StringReader;
+import sailpoint.object.*;
+import sailpoint.api.SailPointContext;
+import sailpoint.tools.xml.XMLObjectFactory;
+import sailpoint.tools.Util;
+import org.apache.commons.codec.digest.DigestUtils;
+
+public class ProcessRoleImportQueueRule {
+    
+    private static final String FETCH_PENDING = 
+        "SELECT ID, ROLE_NAME, EXTERNAL_ID, XML_CONTENT, RETRY_COUNT " +
+        "FROM ROLE_IMPORT_QUEUE " +
+        "WHERE STATUS IN ('PENDING', 'RETRY') " +
+        "AND (RETRY_COUNT < ? OR STATUS = 'PENDING') " +
+        "ORDER BY CREATED_DATE " +
+        "FETCH FIRST ? ROWS ONLY";
+    
+    private static final String UPDATE_STATUS = 
+        "UPDATE ROLE_IMPORT_QUEUE SET STATUS = ?, PROCESSED_DATE = ?, " +
+        "PROCESSED_BY = ?, ERROR_MESSAGE = ?, RETRY_COUNT = ? WHERE ID = ?";
+    
+    private static final String INSERT_STATUS = 
+        "INSERT INTO ROLE_IMPORT_STATUS (ID, IMPORT_ID, STATUS, MESSAGE, DETAILS) " +
+        "VALUES (?, ?, ?, ?, ?)";
+    
+    public void execute(SailPointContext context, TaskResult taskResult, 
+                       Map<String, Object> args) throws Exception {
+        
+        int batchSize = (Integer) args.get("batchSize");
+        int maxRetries = (Integer) args.get("maxRetries");
+        
+        Connection conn = null;
+        int processed = 0;
+        int success = 0;
+        int errors = 0;
+        
+        try {
+            conn = getConnection(context);
+            conn.setAutoCommit(false);
+            
+            // Fetch pending records
+            List<RoleImportRecord> records = fetchPendingRecords(conn, maxRetries, batchSize);
+            
+            for (RoleImportRecord record : records) {
+                try {
+                    processRoleRecord(context, conn, record);
+                    updateStatus(conn, record.id, "SUCCESS", null, record.retryCount);
+                    success++;
+                    
+                } catch (ValidationException ve) {
+                    // Validation failures don't retry
+                    updateStatus(conn, record.id, "FAILED", ve.getMessage(), record.retryCount);
+                    logStatusHistory(conn, record.id, "VALIDATION_FAILED", ve.getMessage());
+                    errors++;
+                    
+                } catch (Exception e) {
+                    // Other errors can retry
+                    if (record.retryCount < maxRetries - 1) {
+                        updateStatus(conn, record.id, "RETRY", e.getMessage(), 
+                                   record.retryCount + 1);
+                        logStatusHistory(conn, record.id, "RETRY_SCHEDULED", e.getMessage());
+                    } else {
+                        updateStatus(conn, record.id, "FAILED", 
+                                   "Max retries exceeded: " + e.getMessage(), 
+                                   record.retryCount);
+                        errors++;
+                    }
+                }
+                processed++;
+                
+                // Commit batch
+                if (processed % 10 == 0) {
+                    conn.commit();
+                }
+            }
+            
+            conn.commit();
+            
+            // Update task result
+            taskResult.setAttribute("totalProcessed", processed);
+            taskResult.setAttribute("successCount", success);
+            taskResult.setAttribute("errorCount", errors);
+            
+            // Archive old successful records
+            archiveProcessedRecords(conn);
+            
+        } finally {
+            if (conn != null) {
+                try { conn.close(); } catch (Exception e) {}
+            }
+        }
+    }
+    
+    private void processRoleRecord(SailPointContext context, Connection conn, 
+                                  RoleImportRecord record) throws Exception {
+        
+        log.info("Processing role import: " + record.roleName + 
+                " (External ID: " + record.externalId + ")");
+        
+        // Validate XML hasn't been tampered with
+        String checksum = DigestUtils.md5Hex(record.xmlContent);
+        
+        // Parse XML
+        XMLObjectFactory xmlFactory = XMLObjectFactory.getInstance();
+        Bundle role = (Bundle) xmlFactory.parseXml(context, 
+                                                  new StringReader(record.xmlContent), 
+                                                  true);
+        
+        // Validate role
+        validateRole(context, role, record);
+        
+        // Check for duplicates by external ID
+        checkDuplicates(context, record.externalId, role.getName());
+        
+        // Enrich metadata
+        role.setAttribute("importId", record.id);
+        role.setAttribute("externalId", record.externalId);
+        role.setAttribute("importDate", new Date());
+        role.setAttribute("importChecksum", checksum);
+        
+        // Check if update or create
+        Bundle existingRole = context.getObjectByName(Bundle.class, role.getName());
+        if (existingRole != null) {
+            // Version control
+            Integer version = (Integer) existingRole.getAttribute("version");
+            role.setAttribute("version", version != null ? version + 1 : 2);
+            role.setAttribute("previousImportId", existingRole.getAttribute("importId"));
+            
+            // Merge attributes
+            mergeRoles(existingRole, role);
+            context.saveObject(existingRole);
+            
+            logStatusHistory(conn, record.id, "UPDATED", 
+                           "Role updated, version: " + role.getAttribute("version"));
+        } else {
+            // New role
+            role.setAttribute("version", 1);
+            context.saveObject(role);
+            
+            logStatusHistory(conn, record.id, "CREATED", "New role created");
+        }
+        
+        context.commitTransaction();
+    }
+    
+    private void validateRole(SailPointContext context, Bundle role, 
+                             RoleImportRecord record) throws ValidationException {
+        
+        List<String> errors = new ArrayList<>();
+        
+        // Validate role name format
+        if (!role.getName().matches("^BANK_ROLE_[A-Z0-9_]+$")) {
+            errors.add("Invalid role name format: " + role.getName());
+        }
+        
+        // Validate owner exists
+        if (role.getOwner() != null) {
+            String ownerName = role.getOwner().getName();
+            Identity owner = context.getObjectByName(Identity.class, ownerName);
+            if (owner == null) {
+                errors.add("Owner not found: " + ownerName);
+            }
+        } else {
+            errors.add("Role owner is required");
+        }
+        
+        // Validate IT roles
+        List<Profile> profiles = role.getProfiles();
+        if (profiles != null) {
+            for (Profile profile : profiles) {
+                if (profile.getReference() != null) {
+                    Bundle itRole = context.getObject(Bundle.class, profile.getReference());
+                    if (itRole == null) {
+                        errors.add("IT Role not found: " + profile.getReference().getName());
+                    }
+                }
+            }
+        }
+        
+        // Business validation
+        String riskLevel = (String) role.getAttribute("riskLevel");
+        if ("High".equals(riskLevel) || "Critical".equals(riskLevel)) {
+            if (!role.isHighRisk()) {
+                errors.add("High/Critical risk roles must have elevated access flag");
+            }
+        }
+        
+        if (!errors.isEmpty()) {
+            throw new ValidationException("Role validation failed", errors);
+        }
+    }
+    
+    // Helper classes and methods
+    class RoleImportRecord {
+        String id;
+        String roleName;
+        String externalId;
+        String xmlContent;
+        int retryCount;
+    }
+    
+    private Connection getConnection(SailPointContext context) throws Exception {
+        Application app = context.getObjectByName(Application.class, "RoleImportDB");
+        // Get connection from app config
+        // In production, use proper connection pooling
+        return DriverManager.getConnection(
+            (String) app.getAttribute("url"),
+            (String) app.getAttribute("user"),
+            context.decrypt((String) app.getAttribute("password"))
+        );
+    }
+    
+    private void archiveProcessedRecords(Connection conn) throws SQLException {
+        String archiveSql = 
+            "INSERT INTO ROLE_IMPORT_ARCHIVE " +
+            "SELECT *, CURRENT_TIMESTAMP, 'SUCCESS' FROM ROLE_IMPORT_QUEUE " +
+            "WHERE STATUS = 'SUCCESS' AND PROCESSED_DATE < CURRENT_TIMESTAMP - 30";
+        
+        String deleteSql = 
+            "DELETE FROM ROLE_IMPORT_QUEUE " +
+            "WHERE STATUS = 'SUCCESS' AND PROCESSED_DATE < CURRENT_TIMESTAMP - 30";
+        
+        try (Statement stmt = conn.createStatement()) {
+            stmt.executeUpdate(archiveSql);
+            stmt.executeUpdate(deleteSql);
+            conn.commit();
+        }
+    }
+}
+
+
+#STep #4 Rest API 
+
+import javax.ws.rs.*;
+import javax.ws.rs.core.*;
+import java.util.UUID;
+
+@Path("/role-import")
+public class RoleImportRestService {
+    
+    @POST
+    @Path("/submit")
+    @Consumes(MediaType.APPLICATION_XML)
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response submitRole(@HeaderParam("X-API-Key") String apiKey,
+                              @HeaderParam("X-Source-System") String sourceSystem,
+                              String xmlContent) {
+        
+        SailPointContext context = SailPointFactory.getCurrentContext();
+        Connection conn = null;
+        
+        try {
+            // Validate API key
+            if (!validateApiKey(apiKey, sourceSystem)) {
+                return Response.status(401).entity(
+                    new ErrorResponse("Invalid API credentials")).build();
+            }
+            
+            // Parse XML to extract key fields
+            Document doc = parseXml(xmlContent);
+            String roleName = extractRoleName(doc);
+            String externalId = extractExternalId(doc);
+            
+            // Generate unique ID
+            String importId = UUID.randomUUID().toString();
+            
+            // Insert into queue
+            conn = getConnection(context);
+            
+            String sql = "INSERT INTO ROLE_IMPORT_QUEUE " +
+                        "(ID, ROLE_NAME, EXTERNAL_ID, XML_CONTENT, CREATED_BY, " +
+                        "SOURCE_SYSTEM, CHECKSUM) VALUES (?, ?, ?, ?, ?, ?, ?)";
+            
+            try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
+                pstmt.setString(1, importId);
+                pstmt.setString(2, roleName);
+                pstmt.setString(3, externalId);
+                pstmt.setClob(4, new StringReader(xmlContent));
+                pstmt.setString(5, sourceSystem);
+                pstmt.setString(6, sourceSystem);
+                pstmt.setString(7, DigestUtils.md5Hex(xmlContent));
+                
+                pstmt.executeUpdate();
+                conn.commit();
+            }
+            
+            // Log submission
+            audit(context, "RoleSubmitted", roleName, sourceSystem);
+            
+            // Return response
+            Map<String, Object> response = new HashMap<>();
+            response.put("importId", importId);
+            response.put("status", "QUEUED");
+            response.put("message", "Role queued for import");
+            
+            return Response.ok(response).build();
+            
+        } catch (DuplicateKeyException e) {
+            return Response.status(409).entity(
+                new ErrorResponse("Role with external ID already exists: " + externalId)).build();
+                
+        } catch (Exception e) {
+            log.error("Error submitting role", e);
+            return Response.status(500).entity(
+                new ErrorResponse("Internal error: " + e.getMessage())).build();
+                
+        } finally {
+            if (conn != null) {
+                try { conn.close(); } catch (Exception e) {}
+            }
+        }
+    }
+    
+    @GET
+    @Path("/status/{importId}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response getStatus(@PathParam("importId") String importId,
+                             @HeaderParam("X-API-Key") String apiKey) {
+        
+        // Query status from ROLE_IMPORT_QUEUE
+        // Return current status, process date, any errors
+    }
+}
+#Step5 - Monitoring Dashboard to monitor the import queue
+
+<Page name="roleImportMonitor">
+  <ReferencedScripts>
+    <Reference class="sailpoint.object.Script" name="Role Import Monitor Script"/>
+  </ReferencedScripts>
+  
+  <Sections>
+    <Section label="Import Queue Status">
+      <Field displayName="Pending" value="script:getPendingCount()"/>
+      <Field displayName="Processing" value="script:getProcessingCount()"/>
+      <Field displayName="Failed" value="script:getFailedCount()"/>
+      <Field displayName="Success (Last 24h)" value="script:getSuccessCount24h()"/>
+    </Section>
+    
+    <Section label="Recent Imports" type="datatable">
+      <DataSource>
+        <Query>
+          SELECT ID, ROLE_NAME, EXTERNAL_ID, STATUS, CREATED_DATE, 
+                 ERROR_MESSAGE, RETRY_COUNT
+          FROM ROLE_IMPORT_QUEUE
+          ORDER BY CREATED_DATE DESC
+          FETCH FIRST 100 ROWS ONLY
+        </Query>
+      </DataSource>
+    </Section>
+  </Sections>
+</Page>
+
+#Step 6 - database maintenance
+
+-- Stored procedure for maintenance
+CREATE OR REPLACE PROCEDURE MAINTAIN_ROLE_IMPORT_QUEUE AS
+BEGIN
+    -- Archive successful imports older than 90 days
+    INSERT INTO ROLE_IMPORT_ARCHIVE
+    SELECT *, SYSDATE, 'AGED_OUT'
+    FROM ROLE_IMPORT_QUEUE
+    WHERE STATUS = 'SUCCESS'
+    AND PROCESSED_DATE < SYSDATE - 90;
+    
+    -- Delete archived records
+    DELETE FROM ROLE_IMPORT_QUEUE
+    WHERE STATUS = 'SUCCESS'
+    AND PROCESSED_DATE < SYSDATE - 90;
+    
+    -- Clean up failed records older than 180 days
+    DELETE FROM ROLE_IMPORT_QUEUE
+    WHERE STATUS = 'FAILED'
+    AND PROCESSED_DATE < SYSDATE - 180;
+    
+    -- Update statistics
+    DBMS_STATS.GATHER_TABLE_STATS('ROLE_IMPORT', 'ROLE_IMPORT_QUEUE');
+    
+    COMMIT;
+END;
+/
+
+-- Schedule weekly execution
+BEGIN
+    DBMS_SCHEDULER.CREATE_JOB(
+        job_name => 'MAINTAIN_ROLE_QUEUE_JOB',
+        job_type => 'STORED_PROCEDURE',
+        job_action => 'MAINTAIN_ROLE_IMPORT_QUEUE',
+        repeat_interval => 'FREQ=WEEKLY; BYDAY=SUN; BYHOUR=2',
+        enabled => TRUE
+    );
+END;
+/
+Excellent question! Using a database table is actually a more robust and scalable approach for enterprise environments. Here's a comprehensive solution for database-based role XML ingestion:
+Database Table Design
+
+First, create tables to store the role XMLs:
+
+-- Main table for role XML documents
+CREATE TABLE ROLE_IMPORT_QUEUE (
+    ID                  VARCHAR(128) PRIMARY KEY,
+    ROLE_NAME          VARCHAR(255) NOT NULL,
+    EXTERNAL_ID        VARCHAR(128) UNIQUE NOT NULL,
+    XML_CONTENT        CLOB NOT NULL,
+    STATUS             VARCHAR(50) DEFAULT 'PENDING',
+    CREATED_DATE       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CREATED_BY         VARCHAR(128),
+    PROCESSED_DATE     TIMESTAMP,
+    PROCESSED_BY       VARCHAR(128),
+    ERROR_MESSAGE      VARCHAR(4000),
+    RETRY_COUNT        INT DEFAULT 0,
+    VERSION            INT DEFAULT 1,
+    CHECKSUM           VARCHAR(64),
+    SOURCE_SYSTEM      VARCHAR(128) DEFAULT 'External Role Modeler'
+);
+
+-- Status tracking table
+CREATE TABLE ROLE_IMPORT_STATUS (
+    ID                  VARCHAR(128) PRIMARY KEY,
+    IMPORT_ID          VARCHAR(128) REFERENCES ROLE_IMPORT_QUEUE(ID),
+    STATUS             VARCHAR(50),
+    STATUS_DATE        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    MESSAGE            VARCHAR(4000),
+    DETAILS            CLOB
+);
+
+-- Archive table for processed records
+CREATE TABLE ROLE_IMPORT_ARCHIVE (
+    -- Same structure as ROLE_IMPORT_QUEUE
+    -- Plus:
+    ARCHIVE_DATE       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ARCHIVE_REASON     VARCHAR(255)
+);
+
+-- Indexes for performance
+CREATE INDEX IDX_RIQ_STATUS ON ROLE_IMPORT_QUEUE(STATUS);
+CREATE INDEX IDX_RIQ_CREATED ON ROLE_IMPORT_QUEUE(CREATED_DATE);
+CREATE INDEX IDX_RIQ_EXTERNAL_ID ON ROLE_IMPORT_QUEUE(EXTERNAL_ID);
+
+
+Step 1: Database Connection Configuration
+
+
+<!-- In SystemConfiguration or as Application -->
+<Application name="RoleImportDB" type="JDBC">
+  <Attributes>
+    <Map>
+      <entry key="url" value="jdbc:oracle:thin:@roledb.bank.com:1521:ROLEDB"/>
+      <entry key="user" value="role_import_user"/>
+      <entry key="password" value="encrypted:AES:7H1s1s3nCryPt3d=="/>
+      <entry key="driverClass" value="oracle.jdbc.driver.OracleDriver"/>
+      <entry key="maxPoolSize" value="10"/>
+      <entry key="minPoolSize" value="2"/>
+    </Map>
+  </Attributes>
+</Application>
+
+
+Step 2: Scheduled Task Definition
+
+
+<TaskDefinition name="Process Role Import Queue" 
+                executor="sailpoint.task.generic.GenericTaskExecutor"
+                type="System"
+                template="true">
+  <Description>Process role XMLs from database queue</Description>
+  <Attributes>
+    <Map>
+      <entry key="ruleRunner" value="Process Role Import Queue Rule"/>
+      <entry key="batchSize" value="50"/>
+      <entry key="processArchived" value="false"/>
+      <entry key="retryFailures" value="true"/>
+      <entry key="maxRetries" value="3"/>
+      <entry key="runAsUser" value="spadmin"/>
+    </Map>
+  </Attributes>
+  <Triggers>
+    <!-- Run every 5 minutes -->
+    <Trigger type="IntervalTrigger" interval="300000"/>
+  </Triggers>
+</TaskDefinition>
+
+
+Step 3: Main Processing Rule
+
+
+import java.sql.*;
+import java.io.StringReader;
+import sailpoint.object.*;
+import sailpoint.api.SailPointContext;
+import sailpoint.tools.xml.XMLObjectFactory;
+import sailpoint.tools.Util;
+import org.apache.commons.codec.digest.DigestUtils;
+
+public class ProcessRoleImportQueueRule {
+    
+    private static final String FETCH_PENDING = 
+        "SELECT ID, ROLE_NAME, EXTERNAL_ID, XML_CONTENT, RETRY_COUNT " +
+        "FROM ROLE_IMPORT_QUEUE " +
+        "WHERE STATUS IN ('PENDING', 'RETRY') " +
+        "AND (RETRY_COUNT < ? OR STATUS = 'PENDING') " +
+        "ORDER BY CREATED_DATE " +
+        "FETCH FIRST ? ROWS ONLY";
+    
+    private static final String UPDATE_STATUS = 
+        "UPDATE ROLE_IMPORT_QUEUE SET STATUS = ?, PROCESSED_DATE = ?, " +
+        "PROCESSED_BY = ?, ERROR_MESSAGE = ?, RETRY_COUNT = ? WHERE ID = ?";
+    
+    private static final String INSERT_STATUS = 
+        "INSERT INTO ROLE_IMPORT_STATUS (ID, IMPORT_ID, STATUS, MESSAGE, DETAILS) " +
+        "VALUES (?, ?, ?, ?, ?)";
+    
+    public void execute(SailPointContext context, TaskResult taskResult, 
+                       Map<String, Object> args) throws Exception {
+        
+        int batchSize = (Integer) args.get("batchSize");
+        int maxRetries = (Integer) args.get("maxRetries");
+        
+        Connection conn = null;
+        int processed = 0;
+        int success = 0;
+        int errors = 0;
+        
+        try {
+            conn = getConnection(context);
+            conn.setAutoCommit(false);
+            
+            // Fetch pending records
+            List<RoleImportRecord> records = fetchPendingRecords(conn, maxRetries, batchSize);
+            
+            for (RoleImportRecord record : records) {
+                try {
+                    processRoleRecord(context, conn, record);
+                    updateStatus(conn, record.id, "SUCCESS", null, record.retryCount);
+                    success++;
+                    
+                } catch (ValidationException ve) {
+                    // Validation failures don't retry
+                    updateStatus(conn, record.id, "FAILED", ve.getMessage(), record.retryCount);
+                    logStatusHistory(conn, record.id, "VALIDATION_FAILED", ve.getMessage());
+                    errors++;
+                    
+                } catch (Exception e) {
+                    // Other errors can retry
+                    if (record.retryCount < maxRetries - 1) {
+                        updateStatus(conn, record.id, "RETRY", e.getMessage(), 
+                                   record.retryCount + 1);
+                        logStatusHistory(conn, record.id, "RETRY_SCHEDULED", e.getMessage());
+                    } else {
+                        updateStatus(conn, record.id, "FAILED", 
+                                   "Max retries exceeded: " + e.getMessage(), 
+                                   record.retryCount);
+                        errors++;
+                    }
+                }
+                processed++;
+                
+                // Commit batch
+                if (processed % 10 == 0) {
+                    conn.commit();
+                }
+            }
+            
+            conn.commit();
+            
+            // Update task result
+            taskResult.setAttribute("totalProcessed", processed);
+            taskResult.setAttribute("successCount", success);
+            taskResult.setAttribute("errorCount", errors);
+            
+            // Archive old successful records
+            archiveProcessedRecords(conn);
+            
+        } finally {
+            if (conn != null) {
+                try { conn.close(); } catch (Exception e) {}
+            }
+        }
+    }
+    
+    private void processRoleRecord(SailPointContext context, Connection conn, 
+                                  RoleImportRecord record) throws Exception {
+        
+        log.info("Processing role import: " + record.roleName + 
+                " (External ID: " + record.externalId + ")");
+        
+        // Validate XML hasn't been tampered with
+        String checksum = DigestUtils.md5Hex(record.xmlContent);
+        
+        // Parse XML
+        XMLObjectFactory xmlFactory = XMLObjectFactory.getInstance();
+        Bundle role = (Bundle) xmlFactory.parseXml(context, 
+                                                  new StringReader(record.xmlContent), 
+                                                  true);
+        
+        // Validate role
+        validateRole(context, role, record);
+        
+        // Check for duplicates by external ID
+        checkDuplicates(context, record.externalId, role.getName());
+        
+        // Enrich metadata
+        role.setAttribute("importId", record.id);
+        role.setAttribute("externalId", record.externalId);
+        role.setAttribute("importDate", new Date());
+        role.setAttribute("importChecksum", checksum);
+        
+        // Check if update or create
+        Bundle existingRole = context.getObjectByName(Bundle.class, role.getName());
+        if (existingRole != null) {
+            // Version control
+            Integer version = (Integer) existingRole.getAttribute("version");
+            role.setAttribute("version", version != null ? version + 1 : 2);
+            role.setAttribute("previousImportId", existingRole.getAttribute("importId"));
+            
+            // Merge attributes
+            mergeRoles(existingRole, role);
+            context.saveObject(existingRole);
+            
+            logStatusHistory(conn, record.id, "UPDATED", 
+                           "Role updated, version: " + role.getAttribute("version"));
+        } else {
+            // New role
+            role.setAttribute("version", 1);
+            context.saveObject(role);
+            
+            logStatusHistory(conn, record.id, "CREATED", "New role created");
+        }
+        
+        context.commitTransaction();
+    }
+    
+    private void validateRole(SailPointContext context, Bundle role, 
+                             RoleImportRecord record) throws ValidationException {
+        
+        List<String> errors = new ArrayList<>();
+        
+        // Validate role name format
+        if (!role.getName().matches("^BANK_ROLE_[A-Z0-9_]+$")) {
+            errors.add("Invalid role name format: " + role.getName());
+        }
+        
+        // Validate owner exists
+        if (role.getOwner() != null) {
+            String ownerName = role.getOwner().getName();
+            Identity owner = context.getObjectByName(Identity.class, ownerName);
+            if (owner == null) {
+                errors.add("Owner not found: " + ownerName);
+            }
+        } else {
+            errors.add("Role owner is required");
+        }
+        
+        // Validate IT roles
+        List<Profile> profiles = role.getProfiles();
+        if (profiles != null) {
+            for (Profile profile : profiles) {
+                if (profile.getReference() != null) {
+                    Bundle itRole = context.getObject(Bundle.class, profile.getReference());
+                    if (itRole == null) {
+                        errors.add("IT Role not found: " + profile.getReference().getName());
+                    }
+                }
+            }
+        }
+        
+        // Business validation
+        String riskLevel = (String) role.getAttribute("riskLevel");
+        if ("High".equals(riskLevel) || "Critical".equals(riskLevel)) {
+            if (!role.isHighRisk()) {
+                errors.add("High/Critical risk roles must have elevated access flag");
+            }
+        }
+        
+        if (!errors.isEmpty()) {
+            throw new ValidationException("Role validation failed", errors);
+        }
+    }
+    
+    // Helper classes and methods
+    class RoleImportRecord {
+        String id;
+        String roleName;
+        String externalId;
+        String xmlContent;
+        int retryCount;
+    }
+    
+    private Connection getConnection(SailPointContext context) throws Exception {
+        Application app = context.getObjectByName(Application.class, "RoleImportDB");
+        // Get connection from app config
+        // In production, use proper connection pooling
+        return DriverManager.getConnection(
+            (String) app.getAttribute("url"),
+            (String) app.getAttribute("user"),
+            context.decrypt((String) app.getAttribute("password"))
+        );
+    }
+    
+    private void archiveProcessedRecords(Connection conn) throws SQLException {
+        String archiveSql = 
+            "INSERT INTO ROLE_IMPORT_ARCHIVE " +
+            "SELECT *, CURRENT_TIMESTAMP, 'SUCCESS' FROM ROLE_IMPORT_QUEUE " +
+            "WHERE STATUS = 'SUCCESS' AND PROCESSED_DATE < CURRENT_TIMESTAMP - 30";
+        
+        String deleteSql = 
+            "DELETE FROM ROLE_IMPORT_QUEUE " +
+            "WHERE STATUS = 'SUCCESS' AND PROCESSED_DATE < CURRENT_TIMESTAMP - 30";
+        
+        try (Statement stmt = conn.createStatement()) {
+            stmt.executeUpdate(archiveSql);
+            stmt.executeUpdate(deleteSql);
+            conn.commit();
+        }
+    }
+}
+
+
+Step 4: REST API Endpoint for External System
+
+Create a REST endpoint for the external system to submit roles:
+
+import javax.ws.rs.*;
+import javax.ws.rs.core.*;
+import java.util.UUID;
+
+@Path("/role-import")
+public class RoleImportRestService {
+    
+    @POST
+    @Path("/submit")
+    @Consumes(MediaType.APPLICATION_XML)
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response submitRole(@HeaderParam("X-API-Key") String apiKey,
+                              @HeaderParam("X-Source-System") String sourceSystem,
+                              String xmlContent) {
+        
+        SailPointContext context = SailPointFactory.getCurrentContext();
+        Connection conn = null;
+        
+        try {
+            // Validate API key
+            if (!validateApiKey(apiKey, sourceSystem)) {
+                return Response.status(401).entity(
+                    new ErrorResponse("Invalid API credentials")).build();
+            }
+            
+            // Parse XML to extract key fields
+            Document doc = parseXml(xmlContent);
+            String roleName = extractRoleName(doc);
+            String externalId = extractExternalId(doc);
+            
+            // Generate unique ID
+            String importId = UUID.randomUUID().toString();
+            
+            // Insert into queue
+            conn = getConnection(context);
+            
+            String sql = "INSERT INTO ROLE_IMPORT_QUEUE " +
+                        "(ID, ROLE_NAME, EXTERNAL_ID, XML_CONTENT, CREATED_BY, " +
+                        "SOURCE_SYSTEM, CHECKSUM) VALUES (?, ?, ?, ?, ?, ?, ?)";
+            
+            try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
+                pstmt.setString(1, importId);
+                pstmt.setString(2, roleName);
+                pstmt.setString(3, externalId);
+                pstmt.setClob(4, new StringReader(xmlContent));
+                pstmt.setString(5, sourceSystem);
+                pstmt.setString(6, sourceSystem);
+                pstmt.setString(7, DigestUtils.md5Hex(xmlContent));
+                
+                pstmt.executeUpdate();
+                conn.commit();
+            }
+            
+            // Log submission
+            audit(context, "RoleSubmitted", roleName, sourceSystem);
+            
+            // Return response
+            Map<String, Object> response = new HashMap<>();
+            response.put("importId", importId);
+            response.put("status", "QUEUED");
+            response.put("message", "Role queued for import");
+            
+            return Response.ok(response).build();
+            
+        } catch (DuplicateKeyException e) {
+            return Response.status(409).entity(
+                new ErrorResponse("Role with external ID already exists: " + externalId)).build();
+                
+        } catch (Exception e) {
+            log.error("Error submitting role", e);
+            return Response.status(500).entity(
+                new ErrorResponse("Internal error: " + e.getMessage())).build();
+                
+        } finally {
+            if (conn != null) {
+                try { conn.close(); } catch (Exception e) {}
+            }
+        }
+    }
+    
+    @GET
+    @Path("/status/{importId}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response getStatus(@PathParam("importId") String importId,
+                             @HeaderParam("X-API-Key") String apiKey) {
+        
+        // Query status from ROLE_IMPORT_QUEUE
+        // Return current status, process date, any errors
+    }
+}
+
+
+Step 5: Monitoring Dashboard
+
+Create a custom page to monitor the import queue:
+
+<Page name="roleImportMonitor">
+  <ReferencedScripts>
+    <Reference class="sailpoint.object.Script" name="Role Import Monitor Script"/>
+  </ReferencedScripts>
+  
+  <Sections>
+    <Section label="Import Queue Status">
+      <Field displayName="Pending" value="script:getPendingCount()"/>
+      <Field displayName="Processing" value="script:getProcessingCount()"/>
+      <Field displayName="Failed" value="script:getFailedCount()"/>
+      <Field displayName="Success (Last 24h)" value="script:getSuccessCount24h()"/>
+    </Section>
+    
+    <Section label="Recent Imports" type="datatable">
+      <DataSource>
+        <Query>
+          SELECT ID, ROLE_NAME, EXTERNAL_ID, STATUS, CREATED_DATE, 
+                 ERROR_MESSAGE, RETRY_COUNT
+          FROM ROLE_IMPORT_QUEUE
+          ORDER BY CREATED_DATE DESC
+          FETCH FIRST 100 ROWS ONLY
+        </Query>
+      </DataSource>
+    </Section>
+  </Sections>
+</Page>
+
+
+Step 6: Database Maintenance
+
+Create a maintenance task to clean up old records:
+
+-- Stored procedure for maintenance
+CREATE OR REPLACE PROCEDURE MAINTAIN_ROLE_IMPORT_QUEUE AS
+BEGIN
+    -- Archive successful imports older than 90 days
+    INSERT INTO ROLE_IMPORT_ARCHIVE
+    SELECT *, SYSDATE, 'AGED_OUT'
+    FROM ROLE_IMPORT_QUEUE
+    WHERE STATUS = 'SUCCESS'
+    AND PROCESSED_DATE < SYSDATE - 90;
+    
+    -- Delete archived records
+    DELETE FROM ROLE_IMPORT_QUEUE
+    WHERE STATUS = 'SUCCESS'
+    AND PROCESSED_DATE < SYSDATE - 90;
+    
+    -- Clean up failed records older than 180 days
+    DELETE FROM ROLE_IMPORT_QUEUE
+    WHERE STATUS = 'FAILED'
+    AND PROCESSED_DATE < SYSDATE - 180;
+    
+    -- Update statistics
+    DBMS_STATS.GATHER_TABLE_STATS('ROLE_IMPORT', 'ROLE_IMPORT_QUEUE');
+    
+    COMMIT;
+END;
+/
+
+-- Schedule weekly execution
+BEGIN
+    DBMS_SCHEDULER.CREATE_JOB(
+        job_name => 'MAINTAIN_ROLE_QUEUE_JOB',
+        job_type => 'STORED_PROCEDURE',
+        job_action => 'MAINTAIN_ROLE_IMPORT_QUEUE',
+        repeat_interval => 'FREQ=WEEKLY; BYDAY=SUN; BYHOUR=2',
+        enabled => TRUE
+    );
+END;
+/
+
+
+Advantages of Database Approach:
+
+- Transactional Integrity - ACID compliance for all operations
+- Better Monitoring - Easy to query status and history
+- Retry Mechanism - Built-in retry with tracking
+- Audit Trail - Complete history in database
+- Scalability - Can handle high volumes
+- No File System Dependencies - Works across distributed systems
+- REST API Integration - Easy to expose as web service
+- Performance - Database indexing for fast queries
+This solution provides a robust, enterprise-grade approach to role ingestion with proper error handling, monitoring, and audit capabilities.
