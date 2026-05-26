@@ -1,305 +1,282 @@
+26 May
+-- ================================================================
+-- Run audit log (replaces the watermark table)
+-- ================================================================
+CREATE TABLE OWN_AP12008.ETL_RUN_LOG (
+    RUN_ID       NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    PROC_NAME    VARCHAR2(50)  NOT NULL,
+    STARTED_AT   DATE          NOT NULL,
+    COMPLETED_AT DATE,
+    STATUS       VARCHAR2(10)  NOT NULL,  -- RUNNING / SUCCESS / FAILED
+    ROW_ARCHIVED NUMBER DEFAULT 0,
+    ROW_EXPIRED  NUMBER DEFAULT 0,
+    ROW_DEPARTED NUMBER DEFAULT 0,
+    ROW_MERGED   NUMBER DEFAULT 0,
+    ERROR_MSG    VARCHAR2(4000)
+);
 
-You said: On SailPoint IIQ 8.
+-- Add BATCH_DT to landing so IIQ aggregation can filter by load
+ALTER TABLE OWN_AP12008.STG_MASTER_ROBI_LANDING
+    ADD BATCH_DT DATE DEFAULT SYSDATE;
 
-LOAD DATA APPEND INTO TABLE OWN_AP12008.STG_MASTER_ROBI TRUNCATE FIELDS TERMINATED BY '|' OPTIONALLY ENCLOSED BY '"' TRAILING NULLCOLS ( ROBID, FLID, START_DATE, END_DATE, ENTITYID, ENTITY, MANAGER, LASTNAME, FIRSTNAME, COUNTRY, LANGUAGE, FUNCTION,
+-- Index to make departure NOT EXISTS fast
+CREATE INDEX OWN_AP12008.IDX_LANDING_ROBID
+    ON OWN_AP12008.STG_MASTER_ROBI_LANDING(ROBID);
 
-pasted
 
-On SailPoint IIQ 8.5, I would like to setup delta agregation for the table STG_MASTER_ROBI jdbc application, loaded by SQL*Loader
+-------
 
-May 8
-Claude responded: Quick clarification before diving in:
-Quick clarification before diving in:
+CREATE OR REPLACE PROCEDURE SP_LOAD_STG_MASTER_ROBI AS
 
-You mentioned delta aggregation for the ROBI JDBC application — I want to confirm which scenario you're in:
+    v_proc_name   VARCHAR2(50) := 'SP_LOAD_STG_MASTER_ROBI';
+    v_table_name  VARCHAR2(50) := 'STG_MASTER_ROBI';
+    v_source_name VARCHAR2(50) := 'ROBI';
 
-User: UPDATED_ON (already exists in STG_MASTER_ROBI)
-Only newly inserted or updated rows (IS_CURRENT = 'Y' + UPDATED_ON filter)
+    -- Dynamic SQL
+    v_where_clause VARCHAR2(4000);
+    v_sql          VARCHAR2(8000);
 
-Here is the full setup for delta aggregation on your ROBI JDBC application.
+    -- Counters
+    v_archived    NUMBER := 0;
+    v_expired     NUMBER := 0;
+    v_departed    NUMBER := 0;
+    v_merged      NUMBER := 0;
 
-The analogy
-Think of full aggregation like a census — IIQ reads every resident each time. Delta aggregation is like a change-of-address notification — IIQ only processes people who moved since the last postman came. The UPDATED_ON column is the postmark date.
+    -- Audit
+    v_run_id      NUMBER;
+    v_batch_dt    DATE := SYSDATE;
 
-1 — The Oracle view (or query) IIQ will use
-Delta aggregation in IIQ works by passing a timestamp parameter into the SQL query at runtime. You need to expose this via the existing IDENTITY_AUTH_SOURCE_VW or a dedicated delta view.
+BEGIN
+    DBMS_OUTPUT.PUT_LINE(v_proc_name || ' started at: ' ||
+        TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS'));
 
-The cleanest approach is a parameterized query directly in the application's JDBC config, not a view, because views can't accept parameters.
+    -- ================================================================
+    -- Open audit log entry
+    -- Like a shift supervisor signing in before starting work
+    -- ================================================================
+    INSERT INTO OWN_AP12008.ETL_RUN_LOG
+        (PROC_NAME, STARTED_AT, STATUS)
+    VALUES
+        (v_proc_name, SYSDATE, 'RUNNING')
+    RETURNING RUN_ID INTO v_run_id;
 
-sql
--- This is what goes into IIQ's "Delta Aggregation Query" field
-SELECT
-    ROBID,
-    FLID,
-    REFOG,
-    ENTITYID,
-    ENTITY,
-    MANAGER,
-    LASTNAME,
-    FIRSTNAME,
-    COUNTRY,
-    LANGUAGE,
-    FUNCTION,
-    EMAIL,
-    TYPE,
-    STATUS,
-    ISTEST,
-    ISRPA,
-    SOURCE,
-    UPDATED_ON
-FROM OWN_AP12008.STG_MASTER_ROBI
-WHERE IS_CURRENT = 'Y'
-  AND UPDATED_ON >= ?
-The ? is IIQ's placeholder — it injects the last aggregation timestamp automatically at runtime.
+    -- Stamp the landing rows with this batch's datetime
+    -- So IIQ aggregation can filter: WHERE BATCH_DT = (SELECT MAX...)
+    UPDATE OWN_AP12008.STG_MASTER_ROBI_LANDING
+    SET    BATCH_DT = v_batch_dt;
 
-2 — IIQ Application configuration (XML / UI)
-In the ROBI application (OWN_AP12008), you need to set these attributes:
+    DBMS_OUTPUT.PUT_LINE('Batch DT: ' ||
+        TO_CHAR(v_batch_dt, 'YYYY-MM-DD HH24:MI:SS') ||
+        ' | Run ID: ' || v_run_id);
 
-Via the UI (Applications → ROBI → Edit)
-Field	Value
-Delta Aggregation	✅ Enabled
-Delta Aggregation Query	The SELECT … WHERE UPDATED_ON >= ? above
-Last Refresh	Left blank on first run — IIQ stores this after each delta run
-Or in the Application XML:
-xml
-<Application name="OWN_AP12008" ...>
-  ...
-  <Attributes>
-    <Map>
-      ...
-      <entry key="deltaAggregation" value="true"/>
-      <entry key="deltaAggregationQuery">
-        <value>
-          <String>
-            SELECT ROBID, FLID, REFOG, ENTITYID, ENTITY, MANAGER,
-                   LASTNAME, FIRSTNAME, COUNTRY, LANGUAGE, FUNCTION,
-                   EMAIL, TYPE, STATUS, ISTEST, ISRPA, SOURCE, UPDATED_ON
-            FROM OWN_AP12008.STG_MASTER_ROBI
-            WHERE IS_CURRENT = 'Y'
-              AND UPDATED_ON >= ?
-          </String>
-        </value>
-      </entry>
-    </Map>
-  </Attributes>
-  ...
-</Application>
-3 — How IIQ manages the timestamp internally
-This is the key mechanic to understand:
+    -- ================================================================
+    -- Safety guard: abort if landing is empty
+    -- Prevents wiping out master if SQL Loader failed silently
+    -- ================================================================
+    DECLARE
+        v_landing_count NUMBER;
+    BEGIN
+        SELECT COUNT(*) INTO v_landing_count
+        FROM   OWN_AP12008.STG_MASTER_ROBI_LANDING;
 
-First delta run  →  IIQ uses epoch (1970-01-01) or the stored "lastRefresh"
-After each run   →  IIQ stores SYSTIMESTAMP into the application's "lastRefresh" attribute
-Next delta run   →  IIQ injects that stored timestamp as the ? parameter
-Think of it like a bookmark in a book — IIQ leaves the bookmark at the last page read, and next time starts from there.
+        IF v_landing_count = 0 THEN
+            UPDATE OWN_AP12008.ETL_RUN_LOG
+            SET    STATUS       = 'FAILED',
+                   COMPLETED_AT = SYSDATE,
+                   ERROR_MSG    = 'Landing table empty - possible SQL Loader failure'
+            WHERE  RUN_ID = v_run_id;
+            COMMIT;
+            DBMS_OUTPUT.PUT_LINE('ABORT: Landing empty. Possible SQL Loader failure.');
+            RETURN;
+        END IF;
 
-You can inspect or reset it in the IIQ DB:
+        DBMS_OUTPUT.PUT_LINE('Landing rows: ' || v_landing_count);
+    END;
 
-sql
--- Check the current lastRefresh stored by IIQ
-SELECT name, attributes
-FROM   sailpoint.spt_application
-WHERE  name = 'OWN_AP12008';
-Or reset it via the UI: Applications → ROBI → Edit → Advanced → Last Refresh (clear it to force a full re-delta from epoch).
+    -- ================================================================
+    -- Build SCD2 change detection WHERE clause (h vs l aliases)
+    -- This is the core diff engine — compares master vs landing
+    -- field by field, like a document comparison tool
+    -- ================================================================
+    v_where_clause := OWN_AP12008.FN_BUILD_SCD2_WHERE_CLAUSE(
+        v_table_name, v_source_name, 'h', 'l');
+    DBMS_OUTPUT.PUT_LINE('Tracking WHERE clause: ' || v_where_clause);
 
-4 — Interaction with your SCD2 procedure
-This is important — the two processes must stay in sync:
+    -- ================================================================
+    -- STEP 1A: Archive changed CURRENT rows to HIST
+    -- Join master (h) to landing (l) on ROBID
+    -- Only archive where SCD2 diff detects actual attribute change
+    -- Analogy: scan both files side by side, photocopy only the
+    --          pages that differ
+    -- ================================================================
+    v_sql :=
+        'INSERT INTO OWN_AP12008.STG_MASTER_ROBI_HIST ' ||
+        'SELECT h.* ' ||
+        'FROM   OWN_AP12008.STG_MASTER_ROBI h ' ||
+        'JOIN   OWN_AP12008.STG_MASTER_ROBI_LANDING l ' ||
+        '  ON   h.ROBID = l.ROBID ' ||
+        'WHERE  h.IS_CURRENT = ''Y'' ' ||
+        '  AND  ' || v_where_clause;
 
-SQL*Loader          →  loads LANDING table
-SP_LOAD_STG_MASTER_ROBI  →  runs SCD2 MERGE, sets UPDATED_ON = SYSDATE on changed/new rows
-IIQ delta task      →  runs AFTER the procedure, picks up rows WHERE UPDATED_ON >= lastRefresh
-Your SP_LOAD_STG_MASTER_ROBI already sets UPDATED_ON = SYSDATE in both the MERGE UPDATE and INSERT branches — so no changes needed to the procedure. Every row touched by the SCD2 logic will be visible to the next delta run automatically.
+    EXECUTE IMMEDIATE v_sql;
+    v_archived := SQL%ROWCOUNT;
+    DBMS_OUTPUT.PUT_LINE('Step 1A - Archived to HIST: ' || v_archived);
 
-5 — One edge case to handle: the race condition
-If IIQ's delta task and SQL*Loader run close together in time, rows written during the IIQ delta window could be missed. The safe pattern is:
+    -- ================================================================
+    -- STEP 1B: Expire changed rows in STG MASTER
+    -- Same set as 1A — expire exactly the rows we just archived
+    -- ================================================================
+    v_sql :=
+        'UPDATE OWN_AP12008.STG_MASTER_ROBI h ' ||
+        'SET    h.IS_CURRENT = ''N'', ' ||
+        '       h.VALID_TO   = TRUNC(SYSDATE), ' ||
+        '       h.UPDATED_ON = SYSDATE ' ||
+        'WHERE  h.IS_CURRENT = ''Y'' ' ||
+        '  AND  EXISTS ( ' ||
+        '    SELECT 1 ' ||
+        '    FROM   OWN_AP12008.STG_MASTER_ROBI_LANDING l ' ||
+        '    WHERE  l.ROBID = h.ROBID ' ||
+        '      AND  ' || v_where_clause ||
+        '  )';
 
-IIQ lastRefresh  =  T-1  (stored from previous run)
-SCD2 proc runs   →  writes UPDATED_ON = T
-IIQ delta runs   →  queries UPDATED_ON >= T-1  ✅ catches all of T
-IIQ stores T+ε   →  next run starts from T+ε
-To be safe, add a small buffer — subtract 5 minutes from the injected timestamp — by wrapping the application's delta query in a view that does the subtraction, or by scheduling the IIQ delta task to run at least 10 minutes after the SQL*Loader job completes.
+    EXECUTE IMMEDIATE v_sql;
+    v_expired := SQL%ROWCOUNT;
+    DBMS_OUTPUT.PUT_LINE('Step 1B - Expired in STG: ' || v_expired);
 
-Execution order summary
-1. sqlldr          → load LANDING table (full snapshot)
-2. SP_LOAD_STG     → SCD2 merge, UPDATED_ON stamped on changes
-3. IIQ Delta Task  → aggregate WHERE IS_CURRENT='Y' AND UPDATED_ON >= lastRefresh
-4. IIQ stores new lastRefresh automatically
-Want me to also set up the IIQ Aggregation Task XML for the scheduled delta task, or show how to test the delta query directly in SQL Developer first?
+    -- ================================================================
+    -- STEP 1C: Handle departed ROBIDs
+    -- CURRENT in master but completely absent from landing
+    -- Landing is a full snapshot so absence = departure
+    -- Analogy: names on yesterday's attendance list that are
+    --          completely missing from today's fresh list
+    -- ================================================================
+    INSERT INTO OWN_AP12008.STG_MASTER_ROBI_HIST
+    SELECT h.*
+    FROM   OWN_AP12008.STG_MASTER_ROBI h
+    WHERE  h.IS_CURRENT = 'Y'
+    AND    NOT EXISTS (
+        SELECT 1
+        FROM   OWN_AP12008.STG_MASTER_ROBI_LANDING l
+        WHERE  l.ROBID = h.ROBID
+    );
+    DBMS_OUTPUT.PUT_LINE('Step 1C - Departed archived: ' || SQL%ROWCOUNT);
 
-You said: Q: What column will IIQ use to detect changes since the last aggregation run?
-Q: What column will IIQ use to detect changes since the last aggregation run?
-A: UPDATED_ON (already exists in STG_MASTER_ROBI)
+    UPDATE OWN_AP12008.STG_MASTER_ROBI h
+    SET    h.IS_CURRENT = 'N',
+           h.VALID_TO   = TRUNC(SYSDATE),
+           h.UPDATED_ON = SYSDATE
+    WHERE  h.IS_CURRENT = 'Y'
+    AND    NOT EXISTS (
+        SELECT 1
+        FROM   OWN_AP12008.STG_MASTER_ROBI_LANDING l
+        WHERE  l.ROBID = h.ROBID
+    );
+    v_departed := SQL%ROWCOUNT;
+    DBMS_OUTPUT.PUT_LINE('Step 1C - Departed expired: ' || v_departed);
 
-Q: Which rows should delta aggregation pick up?
-A: All rows touched by the SCD2 procedure (including expired ones)
+    -- ================================================================
+    -- STEP 2: MERGE landing into master
+    -- WHEN MATCHED + no change  → update UPDATED_ON only (no new SCD2)
+    -- WHEN MATCHED + changed    → already expired in 1B, so this
+    --                             branch inserts new current version
+    -- WHEN NOT MATCHED          → brand new identity, insert fresh
+    -- ================================================================
+    v_where_clause := OWN_AP12008.FN_BUILD_SCD2_WHERE_CLAUSE(
+        v_table_name, v_source_name, 'tgt', 'src');
 
-May 8
-Claude responded: Good — that changes the query meaningfully.
-Good — that changes the query meaningfully. If you want expired rows too (IS_CURRENT = 'N'), IIQ needs to see them to potentially deprovision or flag identities whose ROBI record disappeared or changed.
+    v_sql :=
+        'MERGE INTO OWN_AP12008.STG_MASTER_ROBI tgt ' ||
+        'USING ( ' ||
+        '  SELECT * FROM OWN_AP12008.STG_MASTER_ROBI_LANDING ' ||
+        ') src ' ||
+        'ON (tgt.ROBID = src.ROBID AND tgt.IS_CURRENT = ''Y'') ' ||
+        'WHEN MATCHED THEN ' ||
+        '  UPDATE SET ' ||
+        '    tgt.FLID       = src.FLID, ' ||
+        '    tgt.START_DATE = src.START_DATE, ' ||
+        '    tgt.END_DATE   = src.END_DATE, ' ||
+        '    tgt.ENTITYID   = src.ENTITYID, ' ||
+        '    tgt.ENTITY     = src.ENTITY, ' ||
+        '    tgt.MANAGER    = src.MANAGER, ' ||
+        '    tgt.LASTNAME   = src.LASTNAME, ' ||
+        '    tgt.FIRSTNAME  = src.FIRSTNAME, ' ||
+        '    tgt.COUNTRY    = src.COUNTRY, ' ||
+        '    tgt.LANGUAGE   = src.LANGUAGE, ' ||
+        '    tgt.FUNCTION   = src.FUNCTION, ' ||
+        '    tgt.REFOG      = src.REFOG, ' ||
+        '    tgt.EMAIL      = src.EMAIL, ' ||
+        '    tgt.TYPE       = src.TYPE, ' ||
+        '    tgt.STATUS     = src.STATUS, ' ||
+        '    tgt.ISTEST     = src.ISTEST, ' ||
+        '    tgt.ISRPA      = src.ISRPA, ' ||
+        '    tgt.UPDATED_ON = SYSDATE ' ||
+        '  WHERE NOT ' || v_where_clause ||   -- only truly changed rows
+        'WHEN NOT MATCHED THEN ' ||
+        '  INSERT ( ' ||
+        '    ROBID, FLID, START_DATE, END_DATE, ENTITYID, ' ||
+        '    ENTITY, MANAGER, LASTNAME, FIRSTNAME, COUNTRY, ' ||
+        '    LANGUAGE, FUNCTION, REFOG, EMAIL, TYPE, ' ||
+        '    STATUS, ISTEST, ISRPA, ' ||
+        '    SOURCE, CREATED_ON, UPDATED_ON, ' ||
+        '    VALID_FROM, VALID_TO, IS_CURRENT ' ||
+        '  ) VALUES ( ' ||
+        '    src.ROBID, src.FLID, src.START_DATE, src.END_DATE, src.ENTITYID, ' ||
+        '    src.ENTITY, src.MANAGER, src.LASTNAME, src.FIRSTNAME, src.COUNTRY, ' ||
+        '    src.LANGUAGE, src.FUNCTION, src.REFOG, src.EMAIL, src.TYPE, ' ||
+        '    src.STATUS, src.ISTEST, src.ISRPA, ' ||
+        '    ''ROBI'', SYSDATE, SYSDATE, ' ||
+        '    TRUNC(SYSDATE), DATE ''9999-12-31'', ''Y'' ' ||
+        '  )';
 
-One clarification before writing the query:
+    EXECUTE IMMEDIATE v_sql;
+    v_merged := SQL%ROWCOUNT;
+    DBMS_OUTPUT.PUT_LINE('Step 2 - Rows merged into STG: ' || v_merged);
 
-Good choice — keeping IIQ in the driver's seat is the safest pattern, especially in a banking context where correlation rules and policies should govern what happens downstream.
+    -- ================================================================
+    -- Close audit log as SUCCESS
+    -- ================================================================
+    UPDATE OWN_AP12008.ETL_RUN_LOG
+    SET    STATUS       = 'SUCCESS',
+           COMPLETED_AT = SYSDATE,
+           ROW_ARCHIVED = v_archived,
+           ROW_EXPIRED  = v_expired,
+           ROW_DEPARTED = v_departed,
+           ROW_MERGED   = v_merged
+    WHERE  RUN_ID = v_run_id;
 
-Here is the full updated setup.
+    COMMIT;
+    DBMS_OUTPUT.PUT_LINE(v_proc_name || ' completed at: ' ||
+        TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS'));
 
-The analogy shift
-Previously delta aggregation was a change-of-address notification. Now it's more like a full personnel file update — IIQ receives every record that was touched by the SCD2 run, whether the person got a new role (new current row) or left the building (expired row). IIQ's own correlation engine then decides what to do with each one.
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        -- Log failure without losing the run record
+        -- Use autonomous transaction so log survives the rollback
+        DECLARE
+            PRAGMA AUTONOMOUS_TRANSACTION;
+        BEGIN
+            UPDATE OWN_AP12008.ETL_RUN_LOG
+            SET    STATUS       = 'FAILED',
+                   COMPLETED_AT = SYSDATE,
+                   ERROR_MSG    = SQLERRM || ' | SQL: ' || v_sql
+            WHERE  RUN_ID = v_run_id;
+            COMMIT;
+        END;
+        DBMS_OUTPUT.PUT_LINE(v_proc_name || ' FAILED: ' || SQLERRM);
+        DBMS_OUTPUT.PUT_LINE('Failed SQL: ' || v_sql);
+        RAISE;
 
-1 — Updated delta aggregation query
-Remove the IS_CURRENT = 'Y' filter. Add IS_CURRENT as a returned column so IIQ's rules can act on it.
+END SP_LOAD_STG_MASTER_ROBI;
 
-sql
-SELECT
-    ROBID,
-    FLID,
-    REFOG,
-    ENTITYID,
-    ENTITY,
-    MANAGER,
-    LASTNAME,
-    FIRSTNAME,
-    COUNTRY,
-    LANGUAGE,
-    FUNCTION,
-    EMAIL,
-    TYPE,
-    STATUS,
-    ISTEST,
-    ISRPA,
-    IS_CURRENT,
-    VALID_FROM,
-    VALID_TO,
-    SOURCE,
-    UPDATED_ON
-FROM OWN_AP12008.STG_MASTER_ROBI
-WHERE UPDATED_ON >= ?
-No IS_CURRENT filter — the ? timestamp alone drives what gets picked up.
 
-2 — Why IS_CURRENT, VALID_FROM, VALID_TO must be in the schema
-IIQ needs to see these columns as account attributes on the link, otherwise they're invisible to rules and policies. Make sure they are declared in the application schema:
-
-xml
-<Schema objectType="account" ...>
-  <AttributeDefinition name="IS_CURRENT"  type="string"/>
-  <AttributeDefinition name="VALID_FROM"  type="date"/>
-  <AttributeDefinition name="VALID_TO"    type="date"/>
-  ...
-</Schema>
-Think of the schema like a customs declaration form — only columns declared on the form get through into IIQ's data model. Undeclared columns are silently dropped even if the SQL returns them.
-
-3 — One important problem: multiple rows per ROBID
-Since STG_MASTER_ROBI is now SCD2, a single ROBID can have multiple rows — one current (IS_CURRENT='Y') and one or more expired (IS_CURRENT='N'). The delta query above could return both in the same run.
-
-IIQ's JDBC connector expects one row per account. If it sees two rows with the same correlation key (ROBID or REFOG), behavior is undefined — it may create duplicate links.
-
-The fix — deduplicate in the query, prioritize current row
-sql
-SELECT
-    ROBID,
-    FLID,
-    REFOG,
-    ENTITYID,
-    ENTITY,
-    MANAGER,
-    LASTNAME,
-    FIRSTNAME,
-    COUNTRY,
-    LANGUAGE,
-    FUNCTION,
-    EMAIL,
-    TYPE,
-    STATUS,
-    ISTEST,
-    ISRPA,
-    IS_CURRENT,
-    VALID_FROM,
-    VALID_TO,
-    SOURCE,
-    UPDATED_ON
-FROM (
-    SELECT
-        t.*,
-        ROW_NUMBER() OVER (
-            PARTITION BY ROBID
-            ORDER BY IS_CURRENT DESC,   -- 'Y' sorts before 'N'
-                     VALID_FROM DESC    -- most recent version wins
-        ) AS RN
-    FROM OWN_AP12008.STG_MASTER_ROBI t
-    WHERE UPDATED_ON >= ?
-)
-WHERE RN = 1
-Think of ROW_NUMBER() here like a tiebreaker rule in a competition — if a ROBID has both a current and an expired row touched in the same SCD2 run, the current row wins. If only the expired row was touched (departed identity), it wins by default.
-
-4 — Application XML
-xml
-<entry key="deltaAggregation" value="true"/>
-<entry key="deltaAggregationQuery">
-  <value>
-    <String>
-      SELECT ROBID, FLID, REFOG, ENTITYID, ENTITY, MANAGER,
-             LASTNAME, FIRSTNAME, COUNTRY, LANGUAGE, FUNCTION,
-             EMAIL, TYPE, STATUS, ISTEST, ISRPA,
-             IS_CURRENT, VALID_FROM, VALID_TO, SOURCE, UPDATED_ON
-      FROM (
-          SELECT t.*,
-                 ROW_NUMBER() OVER (
-                     PARTITION BY ROBID
-                     ORDER BY IS_CURRENT DESC, VALID_FROM DESC
-                 ) AS RN
-          FROM OWN_AP12008.STG_MASTER_ROBI t
-          WHERE UPDATED_ON >= ?
-      )
-      WHERE RN = 1
-    </String>
-  </value>
-</entry>
-5 — Letting IIQ decide what to do with IS_CURRENT = 'N'
-Since you chose "IIQ correlation rules decide", the natural place to act is a Customization Rule on the application — it fires after each account is aggregated and can inspect IS_CURRENT:
-
-java
-// Customization Rule on OWN_AP12008
-import sailpoint.object.*;
-
-String isCurrent = (String) object.getAttribute("IS_CURRENT");
-
-if ("N".equals(isCurrent)) {
-    // Signal to IIQ that this account is inactive
-    object.setAttribute("IIQDisabled", true);
-}
-
-return object;
-Think of the Customization Rule as a processing clerk at the border — every aggregated account passes through it, and the clerk stamps "disabled" on the file if IS_CURRENT is N, before it enters IIQ's identity cube.
-
-Updated execution order
-1. sqlldr                    → load LANDING table
-2. SP_LOAD_STG_MASTER_ROBI   → SCD2 merge, UPDATED_ON stamped on ALL touched rows
-3. IIQ Delta Task            → query WHERE UPDATED_ON >= lastRefresh, deduplicated by ROBID
-4. Customization Rule fires  → sets IIQDisabled=true for IS_CURRENT='N' rows
-5. IIQ stores new lastRefresh
-Want me to also write the full Customization Rule with null-safety and logging, or move on to configuring the IIQ Aggregation Task XML for scheduling?
-
-You said: Q: What should IIQ do when it aggregates an expired row (IS_CURRENT = 'N')?
-Q: What should IIQ do when it aggregates an expired row (IS_CURRENT = 'N')?
-A: Just refresh the data — IIQ correlation rules decide the rest
-
-May 8
-Claude responded: That answer was already captured in my previous response — the full setup is there including the deduplication query, the IS_CURRENT schema attributes, and the…
-That answer was already captured in my previous response — the full setup is there including the deduplication query, the IS_CURRENT schema attributes, and the Customization Rule stub that sets IIQDisabled = true for expired rows.
-
-To summarize where we landed:
-
-Delta query — WHERE UPDATED_ON >= ?, no IS_CURRENT filter, deduplicated with ROW_NUMBER() prioritizing the current row
-IIQ schema — IS_CURRENT, VALID_FROM, VALID_TO declared as account attributes
-Customization Rule — inspects IS_CURRENT after aggregation and sets IIQDisabled = true for 'N' rows, leaving the rest to IIQ's correlation engine
-So the question is — where do you want to go next?
-
-Full Customization Rule with null-safety and logging
-Aggregation Task XML for scheduling the delta task
-Testing the delta query in SQL Developer before wiring it into IIQ
-Something else entirely
+26-may
 
 
 
 
 
-Claude is AI and can make mistakes. Please double-check responses.
+
+
+
+
