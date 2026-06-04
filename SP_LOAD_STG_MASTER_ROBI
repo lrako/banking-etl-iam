@@ -105,3 +105,102 @@ EXCEPTION
         RAISE;
 END SP_LOAD_STG_MASTER_ROBI;
 /
+-------
+
+CREATE OR REPLACE FORCE EDITIONABLE VIEW "OWN_AP12008"."IS_MANAGER_VW" 
+(
+    "ROBID", "REFOG", "MANAGER", 
+    "FIRSTNAME", "LASTNAME",
+    "DIRECT_REPORTS_COUNT", "IS_MANAGER"
+) AS
+SELECT
+    main.ROBID,
+    main.REFOG,
+    main.MANAGER,
+    main.FIRSTNAME,
+    main.LASTNAME,
+    dr.direct_reports_count,
+    (CASE
+        WHEN dr.direct_reports_count > 0 THEN 'Y'
+        ELSE 'N'
+    END) AS IS_MANAGER
+FROM OWN_AP12008.STG_MASTER_ROBI main
+-- Pre-aggregate direct reports count then left join
+LEFT JOIN (
+    SELECT 
+        MANAGER,
+        COUNT(*) AS direct_reports_count
+    FROM OWN_AP12008.STG_MASTER_ROBI
+    WHERE MANAGER IS NOT NULL
+    -- NO IS_CURRENT filter anymore - table is already current snapshot
+    GROUP BY MANAGER
+) dr ON dr.MANAGER = main.REFOG;
+-- NO WHERE IS_CURRENT filter anymore
+
+-------
+
+CREATE OR REPLACE FORCE EDITIONABLE VIEW "OWN_AP12008"."IDENTITY_AUTH_SOURCE_VW"
+(
+    "ROBID", "FLID", "REFOG", "START_DATE", "END_DATE",
+    "ENTITYID", "ENTITY", "MANAGER",
+    "LASTNAME", "FIRSTNAME",
+    "COUNTRY", "LANGUAGE", "FUNCTION",
+    "JOB_TITLE", "EMAIL",
+    "TYPE", "INACTIVE_STATUS",
+    "ISTEST", "ISRPA",
+    "IDENTITY_SOURCE", "IS_MANAGER",
+    "USER_TYPE",
+    "LAST_UPDATE_DATE", "LOADED_BY"
+) AS
+SELECT
+    main.ROBID,
+    main.FLID,
+    -- Correlation key: REFOG if present, fallback to FLID
+    NVL(main.REFOG, main.FLID)      AS REFOG,
+    main.START_DATE,
+    main.END_DATE,
+    main.ENTITYID,
+    main.ENTITY,
+    main.MANAGER,
+    main.LASTNAME,
+    main.FIRSTNAME,
+    main.COUNTRY,
+    main.LANGUAGE,
+    main.FUNCTION,
+    -- Enriched job title from JOB_FUNCTION_VW
+    (CASE
+        WHEN main.FUNCTION IS NOT NULL 
+        THEN CONCAT(sjf.JOB_FUNCTION_ID || ': ', sjf.JOB_DESC_EN)
+        ELSE main.FUNCTION
+    END)                            AS JOB_TITLE,
+    main.EMAIL,
+    -- Normalize TYPE codes to IIQ standard values
+    (CASE UPPER(main.TYPE)
+        WHEN 'I'  THEN 'employee'
+        WHEN 'E'  THEN 'contractor'
+        WHEN 'S'  THEN 'service'
+        WHEN 'SY' THEN 'system'
+    END)                            AS TYPE,
+    -- Normalize STATUS for IIQ inactive flag
+    (CASE UPPER(main.STATUS)
+        WHEN 'A' THEN 'false'
+        WHEN 'I' THEN 'true'
+    END)                            AS INACTIVE_STATUS,
+    main.ISTEST,
+    main.ISRPA,
+    -- Tells IIQ which field was used as correlation key
+    (CASE
+        WHEN main.REFOG IS NULL THEN 'FLID'
+        ELSE 'REFOG'
+    END)                            AS IDENTITY_SOURCE,
+    -- IS_MANAGER from self-referencing view
+    NVL(imv.IS_MANAGER, 'N')        AS IS_MANAGER,
+    main.USER_TYPE,
+    main.BATCH_DT                   AS LAST_UPDATE_DATE,
+    main.LOADED_BY
+FROM OWN_AP12008.STG_MASTER_ROBI main
+LEFT JOIN OWN_AP12008.IS_MANAGER_VW  imv 
+    ON imv.ROBID = main.ROBID
+LEFT JOIN OWN_AP12008.JOB_FUNCTION_VW sjf 
+    ON sjf.JOB_FUNCTION_ID = main.FUNCTION;
+-- NO ROW_NUMBER() dedup needed - PK constraint on STG_MASTER_ROBI guarantees 1 row per ROBID
