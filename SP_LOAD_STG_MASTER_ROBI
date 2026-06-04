@@ -1,0 +1,107 @@
+CREATE OR REPLACE PROCEDURE OWN_AP12008.SP_LOAD_STG_MASTER_ROBI
+AS
+    -- Counters for audit logging
+    v_landing_count     NUMBER := 0;
+    v_inserted_count    NUMBER := 0;
+    v_rejected_count    NUMBER := 0;
+    v_duplicate_count   NUMBER := 0;
+    v_start_time        TIMESTAMP := SYSTIMESTAMP;
+
+BEGIN
+
+    -- ----------------------------------------------------------------
+    -- STEP 1: Count incoming records from landing
+    -- ----------------------------------------------------------------
+    SELECT COUNT(*) INTO v_landing_count
+    FROM OWN_AP12008.STG_MASTER_ROBI_LANDING;
+
+    IF v_landing_count = 0 THEN
+        RAISE_APPLICATION_ERROR(
+            -20001, 
+            'SP_LOAD_STG_MASTER_ROBI: Landing table is empty. Aborting.'
+        );
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- STEP 2: Truncate target table (full snapshot replacement)
+    -- Like clearing the warehouse shelf before restocking
+    -- ----------------------------------------------------------------
+    EXECUTE IMMEDIATE 'TRUNCATE TABLE OWN_AP12008.STG_MASTER_ROBI';
+
+    -- ----------------------------------------------------------------
+    -- STEP 3: Insert from landing, deduplicating on ROBID
+    -- If ROBI file has duplicate ROBIDs, keep the latest START_DATE
+    -- This is the safety net replacing the SCD2 ROW_NUMBER() dedup
+    -- ----------------------------------------------------------------
+    INSERT INTO OWN_AP12008.STG_MASTER_ROBI (
+        ROBID, FLID, START_DATE, END_DATE,
+        ENTITYID, ENTITY, MANAGER,
+        LASTNAME, FIRSTNAME,
+        COUNTRY, LANGUAGE,
+        FUNCTION, REFOG, EMAIL,
+        TYPE, STATUS,
+        ISTEST, ISRPA,
+        USER_TYPE, BATCH_DT, LOADED_BY
+    )
+    SELECT
+        ROBID, FLID, START_DATE, END_DATE,
+        ENTITYID, ENTITY, MANAGER,
+        LASTNAME, FIRSTNAME,
+        COUNTRY, LANGUAGE,
+        FUNCTION, REFOG, EMAIL,
+        TYPE, STATUS,
+        ISTEST, ISRPA,
+        -- USER_TYPE not in landing, default to 'PERSONAL'
+        'PERSONAL'          AS USER_TYPE,
+        SYSDATE             AS BATCH_DT,
+        SYS_CONTEXT('USERENV','OS_USER') AS LOADED_BY
+    FROM (
+        SELECT l.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY l.ROBID
+                   ORDER BY 
+                       TO_DATE(l.START_DATE, 'DD/MM/YYYY HH24:MI:SS') DESC
+               ) AS RN
+        FROM OWN_AP12008.STG_MASTER_ROBI_LANDING l
+        WHERE l.ROBID IS NOT NULL          -- reject null PKs
+          AND NVL(l.FLID, l.REFOG) IS NOT NULL  -- reject unresolvable correlation key
+    )
+    WHERE RN = 1;
+
+    v_inserted_count := SQL%ROWCOUNT;
+
+    -- ----------------------------------------------------------------
+    -- STEP 4: Count rejections for audit
+    -- ----------------------------------------------------------------
+    SELECT COUNT(*) INTO v_rejected_count
+    FROM OWN_AP12008.STG_MASTER_ROBI_LANDING
+    WHERE ROBID IS NULL
+       OR NVL(FLID, REFOG) IS NULL;
+
+    v_duplicate_count := v_landing_count 
+                         - v_inserted_count 
+                         - v_rejected_count;
+
+    -- ----------------------------------------------------------------
+    -- STEP 5: Commit
+    -- ----------------------------------------------------------------
+    COMMIT;
+
+    -- ----------------------------------------------------------------
+    -- STEP 6: Audit log output
+    -- ----------------------------------------------------------------
+    DBMS_OUTPUT.PUT_LINE('=== SP_LOAD_STG_MASTER_ROBI ===');
+    DBMS_OUTPUT.PUT_LINE('Start time  : ' || TO_CHAR(v_start_time, 'DD/MM/YYYY HH24:MI:SS'));
+    DBMS_OUTPUT.PUT_LINE('End time    : ' || TO_CHAR(SYSTIMESTAMP, 'DD/MM/YYYY HH24:MI:SS'));
+    DBMS_OUTPUT.PUT_LINE('Landing rows: ' || v_landing_count);
+    DBMS_OUTPUT.PUT_LINE('Inserted    : ' || v_inserted_count);
+    DBMS_OUTPUT.PUT_LINE('Rejected    : ' || v_rejected_count);
+    DBMS_OUTPUT.PUT_LINE('Duplicates  : ' || v_duplicate_count);
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        DBMS_OUTPUT.PUT_LINE('ERROR: ' || SQLERRM);
+        RAISE;
+END SP_LOAD_STG_MASTER_ROBI;
+/
