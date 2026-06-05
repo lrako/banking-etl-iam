@@ -1,0 +1,299 @@
+CREATE OR REPLACE PROCEDURE OWN_AP12008.SP_LOAD_STG_MASTER_ROBI_DELTA
+AS
+    v_current_batch_date    DATE;
+    v_count_new             NUMBER := 0;
+    v_count_changed         NUMBER := 0;
+    v_count_deleted         NUMBER := 0;
+    v_start_time            TIMESTAMP := SYSTIMESTAMP;
+
+    -- ----------------------------------------------------------------
+    -- Hash computation extracted as local function for DRY principle
+    -- Think of it as the fingerprint scanner — same scanner used
+    -- for enrollment (NEW), verification (CHANGED) and
+    -- departure check (DELETED)
+    -- ----------------------------------------------------------------
+    FUNCTION FN_COMPUTE_HASH(
+        p_robid     VARCHAR2,
+        p_flid      VARCHAR2,
+        p_start_dt  VARCHAR2,
+        p_end_dt    VARCHAR2,
+        p_entityid  VARCHAR2,
+        p_entity    VARCHAR2,
+        p_manager   VARCHAR2,
+        p_lastname  VARCHAR2,
+        p_firstname VARCHAR2,
+        p_country   VARCHAR2,
+        p_language  VARCHAR2,
+        p_function  VARCHAR2,
+        p_email     VARCHAR2,
+        p_type      VARCHAR2,
+        p_status    VARCHAR2,
+        p_istest    VARCHAR2,
+        p_isrpa     VARCHAR2,
+        p_usertype  VARCHAR2
+    ) RETURN NUMBER IS
+    BEGIN
+        RETURN ORA_HASH(
+            p_robid     || '|' ||
+            p_flid      || '|' ||
+            p_start_dt  || '|' ||
+            p_end_dt    || '|' ||
+            p_entityid  || '|' ||
+            p_entity    || '|' ||
+            p_manager   || '|' ||
+            p_lastname  || '|' ||
+            p_firstname || '|' ||
+            p_country   || '|' ||
+            p_language  || '|' ||
+            p_function  || '|' ||
+            p_email     || '|' ||
+            p_type      || '|' ||
+            p_status    || '|' ||
+            p_istest    || '|' ||
+            p_isrpa     || '|' ||
+            p_usertype
+        );
+    END FN_COMPUTE_HASH;
+
+BEGIN
+
+    -- ----------------------------------------------------------------
+    -- STEP 1: Get current batch date from main table
+    -- ----------------------------------------------------------------
+    SELECT MAX(BATCH_DATE)
+    INTO v_current_batch_date
+    FROM OWN_AP12008.STG_MASTER_ROBI;
+
+    IF v_current_batch_date IS NULL THEN
+        RAISE_APPLICATION_ERROR(
+            -20001,
+            'SP_LOAD_STG_MASTER_ROBI_DELTA: STG_MASTER_ROBI is empty. Aborting.'
+        );
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- STEP 2: Detect NEW identities
+    -- REFOG exists in STG_MASTER_ROBI but has no entry in hash table
+    -- Like a first-time visitor with no fingerprint on file
+    -- ----------------------------------------------------------------
+
+    -- 2a: Write NEW entries to delta table
+    INSERT INTO OWN_AP12008.STG_MASTER_ROBI_DELTA
+        (REFOG, CHANGE_TYPE, BATCH_DATE, DETECTED_ON, IS_PROCESSED)
+    SELECT
+        r.REFOG,
+        'NEW',
+        v_current_batch_date,
+        SYSTIMESTAMP,
+        'N'
+    FROM OWN_AP12008.STG_MASTER_ROBI r
+    WHERE r.REFOG IS NOT NULL
+      -- No fingerprint on file
+      AND NOT EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI_HASH h
+          WHERE h.REFOG = r.REFOG
+      )
+      -- Idempotency: skip if already pending
+      AND NOT EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI_DELTA d
+          WHERE d.REFOG        = r.REFOG
+            AND d.IS_PROCESSED = 'N'
+            AND d.CHANGE_TYPE  = 'NEW'
+      );
+
+    v_count_new := SQL%ROWCOUNT;
+
+    -- 2b: Enroll new fingerprints into hash table
+    INSERT INTO OWN_AP12008.STG_MASTER_ROBI_HASH
+        (REFOG, ROW_HASH, IS_ACTIVE, FIRST_SEEN_ON, LAST_SEEN_ON)
+    SELECT
+        r.REFOG,
+        FN_COMPUTE_HASH(
+            r.ROBID, r.FLID, r.START_DATE, r.END_DATE,
+            r.ENTITYID, r.ENTITY, r.MANAGER,
+            r.LASTNAME, r.FIRSTNAME,
+            r.COUNTRY, r.LANGUAGE,
+            r.FUNCTION, r.EMAIL,
+            r.TYPE, r.STATUS,
+            r.ISTEST, r.ISRPA, r.USER_TYPE
+        ),
+        'Y',
+        v_current_batch_date,
+        v_current_batch_date
+    FROM OWN_AP12008.STG_MASTER_ROBI r
+    WHERE r.REFOG IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI_HASH h
+          WHERE h.REFOG = r.REFOG
+      );
+
+    -- ----------------------------------------------------------------
+    -- STEP 3: Detect CHANGED identities
+    -- REFOG exists in both tables but hash differs
+    -- Like a returning visitor whose fingerprint no longer matches
+    -- ----------------------------------------------------------------
+
+    -- 3a: Write CHANGED entries to delta table
+    INSERT INTO OWN_AP12008.STG_MASTER_ROBI_DELTA
+        (REFOG, CHANGE_TYPE, BATCH_DATE, DETECTED_ON, IS_PROCESSED)
+    SELECT
+        r.REFOG,
+        'CHANGED',
+        v_current_batch_date,
+        SYSTIMESTAMP,
+        'N'
+    FROM OWN_AP12008.STG_MASTER_ROBI r
+    JOIN OWN_AP12008.STG_MASTER_ROBI_HASH h
+        ON h.REFOG     = r.REFOG
+       AND h.IS_ACTIVE = 'Y'
+    WHERE r.REFOG IS NOT NULL
+      -- Hash mismatch = something changed
+      AND h.ROW_HASH != FN_COMPUTE_HASH(
+            r.ROBID, r.FLID, r.START_DATE, r.END_DATE,
+            r.ENTITYID, r.ENTITY, r.MANAGER,
+            r.LASTNAME, r.FIRSTNAME,
+            r.COUNTRY, r.LANGUAGE,
+            r.FUNCTION, r.EMAIL,
+            r.TYPE, r.STATUS,
+            r.ISTEST, r.ISRPA, r.USER_TYPE
+          )
+      -- Idempotency: skip if already pending
+      AND NOT EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI_DELTA d
+          WHERE d.REFOG        = r.REFOG
+            AND d.IS_PROCESSED = 'N'
+            AND d.CHANGE_TYPE  = 'CHANGED'
+      );
+
+    v_count_changed := SQL%ROWCOUNT;
+
+    -- 3b: Update hash fingerprints for changed identities
+    MERGE INTO OWN_AP12008.STG_MASTER_ROBI_HASH h
+    USING (
+        SELECT
+            r.REFOG,
+            FN_COMPUTE_HASH(
+                r.ROBID, r.FLID, r.START_DATE, r.END_DATE,
+                r.ENTITYID, r.ENTITY, r.MANAGER,
+                r.LASTNAME, r.FIRSTNAME,
+                r.COUNTRY, r.LANGUAGE,
+                r.FUNCTION, r.EMAIL,
+                r.TYPE, r.STATUS,
+                r.ISTEST, r.ISRPA, r.USER_TYPE
+            ) AS NEW_HASH,
+            v_current_batch_date AS BATCH_DATE
+        FROM OWN_AP12008.STG_MASTER_ROBI r
+        WHERE r.REFOG IS NOT NULL
+    ) src ON (h.REFOG = src.REFOG AND h.IS_ACTIVE = 'Y')
+    WHEN MATCHED THEN UPDATE SET
+        h.ROW_HASH     = src.NEW_HASH,
+        h.LAST_SEEN_ON = src.BATCH_DATE,
+        h.IS_ACTIVE    = 'Y';
+
+    -- ----------------------------------------------------------------
+    -- STEP 4: Detect DELETED identities
+    -- Active in hash table but missing from today's STG_MASTER_ROBI
+    -- STG_MASTER_ROBI_DELETED already populated by
+    -- SP_LOAD_STG_MASTER_ROBI — our job here is delta + hash update
+    -- Like a fingerprint card still in the cabinet
+    -- but the person never showed up today
+    -- ----------------------------------------------------------------
+
+    -- 4a: Write DELETED entries to delta table
+    INSERT INTO OWN_AP12008.STG_MASTER_ROBI_DELTA
+        (REFOG, CHANGE_TYPE, BATCH_DATE, DETECTED_ON, IS_PROCESSED)
+    SELECT
+        h.REFOG,
+        'DELETED',
+        v_current_batch_date,
+        SYSTIMESTAMP,
+        'N'
+    FROM OWN_AP12008.STG_MASTER_ROBI_HASH h
+    WHERE h.IS_ACTIVE = 'Y'
+      -- Missing from today's active snapshot
+      AND NOT EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI r
+          WHERE r.REFOG = h.REFOG
+      )
+      -- Idempotency: skip if already pending
+      AND NOT EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI_DELTA d
+          WHERE d.REFOG        = h.REFOG
+            AND d.IS_PROCESSED = 'N'
+            AND d.CHANGE_TYPE  = 'DELETED'
+      );
+
+    v_count_deleted := SQL%ROWCOUNT;
+
+    -- 4b: Deactivate hash fingerprints for deleted identities
+    UPDATE OWN_AP12008.STG_MASTER_ROBI_HASH h
+    SET
+        h.IS_ACTIVE      = 'N',
+        h.DEACTIVATED_ON = SYSTIMESTAMP
+    WHERE h.IS_ACTIVE = 'Y'
+      AND NOT EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI r
+          WHERE r.REFOG = h.REFOG
+      );
+
+    -- ----------------------------------------------------------------
+    -- STEP 5: Handle reactivations in hash table
+    -- REFOG was IS_ACTIVE='N' but reappears in STG_MASTER_ROBI
+    -- SP_LOAD_STG_MASTER_ROBI already updated STG_MASTER_ROBI_DELETED
+    -- Here we reactivate the fingerprint card
+    -- ----------------------------------------------------------------
+    UPDATE OWN_AP12008.STG_MASTER_ROBI_HASH h
+    SET
+        h.IS_ACTIVE      = 'Y',
+        h.DEACTIVATED_ON = NULL,
+        h.LAST_SEEN_ON   = v_current_batch_date,
+        h.ROW_HASH       = (
+            SELECT FN_COMPUTE_HASH(
+                r.ROBID, r.FLID, r.START_DATE, r.END_DATE,
+                r.ENTITYID, r.ENTITY, r.MANAGER,
+                r.LASTNAME, r.FIRSTNAME,
+                r.COUNTRY, r.LANGUAGE,
+                r.FUNCTION, r.EMAIL,
+                r.TYPE, r.STATUS,
+                r.ISTEST, r.ISRPA, r.USER_TYPE
+            )
+            FROM OWN_AP12008.STG_MASTER_ROBI r
+            WHERE r.REFOG = h.REFOG
+        )
+    WHERE h.IS_ACTIVE = 'N'
+      AND EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI r
+          WHERE r.REFOG = h.REFOG
+      );
+
+    -- ----------------------------------------------------------------
+    -- STEP 6: Commit all changes atomically
+    -- ----------------------------------------------------------------
+    COMMIT;
+
+    -- ----------------------------------------------------------------
+    -- STEP 7: Audit output
+    -- ----------------------------------------------------------------
+    DBMS_OUTPUT.PUT_LINE('=== SP_LOAD_STG_MASTER_ROBI_DELTA ===');
+    DBMS_OUTPUT.PUT_LINE('Start time : ' || TO_CHAR(v_start_time,         'DD/MM/YYYY HH24:MI:SS'));
+    DBMS_OUTPUT.PUT_LINE('End time   : ' || TO_CHAR(SYSTIMESTAMP,         'DD/MM/YYYY HH24:MI:SS'));
+    DBMS_OUTPUT.PUT_LINE('Batch date : ' || TO_CHAR(v_current_batch_date, 'DD/MM/YYYY'));
+    DBMS_OUTPUT.PUT_LINE('NEW        : ' || v_count_new);
+    DBMS_OUTPUT.PUT_LINE('CHANGED    : ' || v_count_changed);
+    DBMS_OUTPUT.PUT_LINE('DELETED    : ' || v_count_deleted);
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        DBMS_OUTPUT.PUT_LINE('ERROR: ' || SQLERRM);
+        RAISE;
+END SP_LOAD_STG_MASTER_ROBI_DELTA;
+/
