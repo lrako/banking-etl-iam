@@ -344,5 +344,625 @@ EXCEPTION
         RAISE;
 END SP_LOAD_STG_MASTER_ROBI_DELTA;
 /
+----postIterate field
 
+-- In IIQ JDBC connector postIterateSQL field:
+UPDATE OWN_AP12008.STG_MASTER_ROBI_DELTA
+SET
+    IS_PROCESSED  = 'Y',
+    PROCESSED_ON  = SYSTIMESTAMP,
+    PROCESSED_BY  = 'IIQ_DELTA_AGG'
+WHERE IS_PROCESSED = 'N'
+
+------------ HASH DELTA --- 
+
+-- hash tracking table
+CREATE TABLE OWN_AP12008.STG_MASTER_ROBI_HASH
+(
+    REFOG           VARCHAR2(16 BYTE)   NOT NULL,
+    ROW_HASH        NUMBER              NOT NULL,  -- ORA_HASH result
+    IS_ACTIVE       VARCHAR2(1 BYTE)    DEFAULT 'Y' NOT NULL,
+    FIRST_SEEN_ON   DATE                DEFAULT SYSDATE NOT NULL,
+    LAST_SEEN_ON    DATE                DEFAULT SYSDATE NOT NULL,
+    DEACTIVATED_ON  TIMESTAMP,
+    CONSTRAINT PK_STG_ROBI_HASH PRIMARY KEY (REFOG),
+    CONSTRAINT CHK_HASH_ACTIVE CHECK (IS_ACTIVE IN ('Y','N'))
+)
+SEGMENT CREATION IMMEDIATE
+TABLESPACE "DATA0001";
+
+CREATE INDEX IDX_HASH_ROBI_ACTIVE
+    ON OWN_AP12008.STG_MASTER_ROBI_HASH(IS_ACTIVE);
+
+---update robi_master_delta
+
+CREATE TABLE OWN_AP12008.STG_MASTER_ROBI_DELTA
+(
+    DELTA_ID        NUMBER GENERATED ALWAYS AS IDENTITY,
+    REFOG           VARCHAR2(16 BYTE)   NOT NULL,
+    CHANGE_TYPE     VARCHAR2(8 BYTE)    NOT NULL, -- NEW/CHANGED/DELETED
+    BATCH_DATE      DATE                NOT NULL,
+    DETECTED_ON     TIMESTAMP           DEFAULT SYSTIMESTAMP NOT NULL,
+    IS_PROCESSED    VARCHAR2(1 BYTE)    DEFAULT 'N' NOT NULL,
+    PROCESSED_ON    TIMESTAMP,
+    PROCESSED_BY    VARCHAR2(64 BYTE),
+    CONSTRAINT PK_STG_ROBI_DELTA    PRIMARY KEY (DELTA_ID),
+    CONSTRAINT CHK_DELTA_PROCESSED  CHECK (IS_PROCESSED IN ('Y','N')),
+    CONSTRAINT CHK_DELTA_CHANGE     CHECK (CHANGE_TYPE IN ('NEW','CHANGED','DELETED'))
+)
+SEGMENT CREATION IMMEDIATE
+TABLESPACE "DATA0001";
+
+CREATE INDEX IDX_DELTA_ROBI_UNPROCESSED
+    ON OWN_AP12008.STG_MASTER_ROBI_DELTA(IS_PROCESSED, BATCH_DATE);
+
+CREATE INDEX IDX_DELTA_ROBI_REFOG
+    ON OWN_AP12008.STG_MASTER_ROBI_DELTA(REFOG);
+
+CREATE INDEX IDX_DELTA_ROBI_CHANGETYPE
+    ON OWN_AP12008.STG_MASTER_ROBI_DELTA(CHANGE_TYPE, IS_PROCESSED);
+
+----uptdate stored proc SP_ROBI_MASTER_DELTA
+CREATE OR REPLACE PROCEDURE OWN_AP12008.SP_LOAD_STG_MASTER_ROBI_DELTA
+AS
+    v_current_batch_date    DATE;
+    v_count_new             NUMBER := 0;
+    v_count_changed         NUMBER := 0;
+    v_count_deleted         NUMBER := 0;
+    v_start_time            TIMESTAMP := SYSTIMESTAMP;
+
+BEGIN
+
+    -- ----------------------------------------------------------------
+    -- STEP 1: Get current batch date
+    -- ----------------------------------------------------------------
+    SELECT MAX(BATCH_DATE)
+    INTO v_current_batch_date
+    FROM OWN_AP12008.STG_MASTER_ROBI;
+
+    IF v_current_batch_date IS NULL THEN
+        RAISE_APPLICATION_ERROR(
+            -20001,
+            'SP_LOAD_STG_MASTER_ROBI_DELTA: STG_MASTER_ROBI is empty.'
+        );
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- STEP 2: Compute hash for all current rows
+    -- ORA_HASH concatenates all tracked columns into one fingerprint.
+    -- Like grinding all ingredients into one smoothie —
+    -- if any ingredient changes, the smoothie tastes different.
+    -- ----------------------------------------------------------------
+    -- STEP 2a: Detect NEW identities
+    -- REFOG exists in STG_MASTER_ROBI but NOT in hash table
+    -- ----------------------------------------------------------------
+    INSERT INTO OWN_AP12008.STG_MASTER_ROBI_DELTA
+        (REFOG, CHANGE_TYPE, BATCH_DATE, DETECTED_ON, IS_PROCESSED)
+    SELECT
+        r.REFOG,
+        'NEW',
+        v_current_batch_date,
+        SYSTIMESTAMP,
+        'N'
+    FROM OWN_AP12008.STG_MASTER_ROBI r
+    WHERE r.REFOG IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI_HASH h
+          WHERE h.REFOG = r.REFOG
+      );
+
+    v_count_new := SQL%ROWCOUNT;
+
+    -- Insert hash rows for new identities
+    INSERT INTO OWN_AP12008.STG_MASTER_ROBI_HASH
+        (REFOG, ROW_HASH, IS_ACTIVE, FIRST_SEEN_ON, LAST_SEEN_ON)
+    SELECT
+        r.REFOG,
+        ORA_HASH(
+            r.ROBID        || '|' ||
+            r.FLID         || '|' ||
+            r.START_DATE   || '|' ||
+            r.END_DATE     || '|' ||
+            r.ENTITYID     || '|' ||
+            r.ENTITY       || '|' ||
+            r.MANAGER      || '|' ||
+            r.LASTNAME     || '|' ||
+            r.FIRSTNAME    || '|' ||
+            r.COUNTRY      || '|' ||
+            r.LANGUAGE     || '|' ||
+            r.FUNCTION     || '|' ||
+            r.EMAIL        || '|' ||
+            r.TYPE         || '|' ||
+            r.STATUS       || '|' ||
+            r.ISTEST       || '|' ||
+            r.ISRPA        || '|' ||
+            r.USER_TYPE
+        ),
+        'Y',
+        v_current_batch_date,
+        v_current_batch_date
+    FROM OWN_AP12008.STG_MASTER_ROBI r
+    WHERE r.REFOG IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI_HASH h
+          WHERE h.REFOG = r.REFOG
+      );
+
+    -- ----------------------------------------------------------------
+    -- STEP 2b: Detect CHANGED identities
+    -- REFOG exists in both tables but hash differs
+    -- Like comparing today's fingerprint against the filing cabinet —
+    -- same person, different print = something changed
+    -- ----------------------------------------------------------------
+    INSERT INTO OWN_AP12008.STG_MASTER_ROBI_DELTA
+        (REFOG, CHANGE_TYPE, BATCH_DATE, DETECTED_ON, IS_PROCESSED)
+    SELECT
+        r.REFOG,
+        'CHANGED',
+        v_current_batch_date,
+        SYSTIMESTAMP,
+        'N'
+    FROM OWN_AP12008.STG_MASTER_ROBI r
+    JOIN OWN_AP12008.STG_MASTER_ROBI_HASH h
+        ON h.REFOG = r.REFOG
+    WHERE r.REFOG IS NOT NULL
+      AND h.IS_ACTIVE = 'Y'
+      AND h.ROW_HASH != ORA_HASH(
+            r.ROBID        || '|' ||
+            r.FLID         || '|' ||
+            r.START_DATE   || '|' ||
+            r.END_DATE     || '|' ||
+            r.ENTITYID     || '|' ||
+            r.ENTITY       || '|' ||
+            r.MANAGER      || '|' ||
+            r.LASTNAME     || '|' ||
+            r.FIRSTNAME    || '|' ||
+            r.COUNTRY      || '|' ||
+            r.LANGUAGE     || '|' ||
+            r.FUNCTION     || '|' ||
+            r.EMAIL        || '|' ||
+            r.TYPE         || '|' ||
+            r.STATUS       || '|' ||
+            r.ISTEST       || '|' ||
+            r.ISRPA        || '|' ||
+            r.USER_TYPE
+          );
+
+    v_count_changed := SQL%ROWCOUNT;
+
+    -- Update hash for changed identities
+    UPDATE OWN_AP12008.STG_MASTER_ROBI_HASH h
+    SET
+        h.ROW_HASH    = ORA_HASH(
+            (SELECT
+                r.ROBID        || '|' ||
+                r.FLID         || '|' ||
+                r.START_DATE   || '|' ||
+                r.END_DATE     || '|' ||
+                r.ENTITYID     || '|' ||
+                r.ENTITY       || '|' ||
+                r.MANAGER      || '|' ||
+                r.LASTNAME     || '|' ||
+                r.FIRSTNAME    || '|' ||
+                r.COUNTRY      || '|' ||
+                r.LANGUAGE     || '|' ||
+                r.FUNCTION     || '|' ||
+                r.EMAIL        || '|' ||
+                r.TYPE         || '|' ||
+                r.STATUS       || '|' ||
+                r.ISTEST       || '|' ||
+                r.ISRPA        || '|' ||
+                r.USER_TYPE
+            FROM OWN_AP12008.STG_MASTER_ROBI r
+            WHERE r.REFOG = h.REFOG)
+        ),
+        h.LAST_SEEN_ON  = v_current_batch_date,
+        h.IS_ACTIVE     = 'Y'
+    WHERE EXISTS (
+        SELECT 1
+        FROM OWN_AP12008.STG_MASTER_ROBI r
+        WHERE r.REFOG = h.REFOG
+    );
+
+    -- ----------------------------------------------------------------
+    -- STEP 2c: Detect DELETED identities
+    -- REFOG was active in hash table but missing from today's load
+    -- Like a fingerprint card still in the cabinet
+    -- but the person didn't show up today
+    -- ----------------------------------------------------------------
+    INSERT INTO OWN_AP12008.STG_MASTER_ROBI_DELTA
+        (REFOG, CHANGE_TYPE, BATCH_DATE, DETECTED_ON, IS_PROCESSED)
+    SELECT
+        h.REFOG,
+        'DELETED',
+        v_current_batch_date,
+        SYSTIMESTAMP,
+        'N'
+    FROM OWN_AP12008.STG_MASTER_ROBI_HASH h
+    WHERE h.IS_ACTIVE = 'Y'
+      AND NOT EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI r
+          WHERE r.REFOG = h.REFOG
+      );
+
+    v_count_deleted := SQL%ROWCOUNT;
+
+    -- Mark deleted identities as inactive in hash table
+    -- Keep the row — just lower the IS_ACTIVE flag
+    UPDATE OWN_AP12008.STG_MASTER_ROBI_HASH h
+    SET
+        h.IS_ACTIVE      = 'N',
+        h.DEACTIVATED_ON = SYSTIMESTAMP
+    WHERE h.IS_ACTIVE = 'Y'
+      AND NOT EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI r
+          WHERE r.REFOG = h.REFOG
+      );
+
+    -- ----------------------------------------------------------------
+    -- STEP 3: Commit all changes atomically
+    -- ----------------------------------------------------------------
+    COMMIT;
+
+    DBMS_OUTPUT.PUT_LINE('=== SP_LOAD_STG_MASTER_ROBI_DELTA ===');
+    DBMS_OUTPUT.PUT_LINE('Start time : ' || TO_CHAR(v_start_time,        'DD/MM/YYYY HH24:MI:SS'));
+    DBMS_OUTPUT.PUT_LINE('End time   : ' || TO_CHAR(SYSTIMESTAMP,        'DD/MM/YYYY HH24:MI:SS'));
+    DBMS_OUTPUT.PUT_LINE('Batch date : ' || TO_CHAR(v_current_batch_date,'DD/MM/YYYY'));
+    DBMS_OUTPUT.PUT_LINE('NEW        : ' || v_count_new);
+    DBMS_OUTPUT.PUT_LINE('CHANGED    : ' || v_count_changed);
+    DBMS_OUTPUT.PUT_LINE('DELETED    : ' || v_count_deleted);
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        DBMS_OUTPUT.PUT_LINE('ERROR: ' || SQLERRM);
+        RAISE;
+END SP_LOAD_STG_MASTER_ROBI_DELTA;
+/
+
+---- change delta aggregation SQL in IIQ
+
+-- Delta Aggregation SQL in IIQ connector:
+SELECT REFOG
+FROM OWN_AP12008.STG_MASTER_ROBI_DELTA
+WHERE IS_PROCESSED = 'N'
+  AND CHANGE_TYPE IN ('NEW', 'CHANGED')
+
+------ DELETED identities managemenet
+
+CREATE TABLE OWN_AP12008.STG_MASTER_ROBI_DELETED
+(
+    -- Business columns (snapshot of last known state)
+    ROBID           VARCHAR2(32 BYTE)   NOT NULL,
+    FLID            VARCHAR2(32 BYTE),
+    START_DATE      VARCHAR2(16 BYTE),
+    END_DATE        VARCHAR2(16 BYTE),
+    ENTITYID        VARCHAR2(16 BYTE),
+    ENTITY          VARCHAR2(256 BYTE),
+    MANAGER         VARCHAR2(16 BYTE),
+    LASTNAME        VARCHAR2(128 BYTE),
+    FIRSTNAME       VARCHAR2(128 BYTE),
+    COUNTRY         VARCHAR2(3 BYTE),
+    LANGUAGE        VARCHAR2(3 BYTE),
+    FUNCTION        VARCHAR2(256 BYTE),
+    REFOG           VARCHAR2(16 BYTE)   NOT NULL,
+    EMAIL           VARCHAR2(256 BYTE),
+    TYPE            VARCHAR2(32 BYTE),
+    STATUS          VARCHAR2(32 BYTE),
+    ISTEST          VARCHAR2(8 BYTE),
+    ISRPA           VARCHAR2(8 BYTE),
+    USER_TYPE       VARCHAR2(32 BYTE),
+    -- Lifecycle tracking columns
+    LAST_BATCH_DATE DATE,
+    DELETED_ON      TIMESTAMP           DEFAULT SYSTIMESTAMP NOT NULL,
+    REACTIVATED_ON  TIMESTAMP,
+    IS_REACTIVATED  VARCHAR2(1 BYTE)    DEFAULT 'N' NOT NULL,
+    CONSTRAINT PK_STG_ROBI_DELETED  PRIMARY KEY (ROBID),
+    CONSTRAINT CHK_DELETED_REACTIV  CHECK (IS_REACTIVATED IN ('Y','N'))
+)
+SEGMENT CREATION IMMEDIATE
+TABLESPACE "DATA0001";
+
+-- IIQ getObjectSQL lookup
+CREATE INDEX IDX_DELETED_ROBI_REFOG
+    ON OWN_AP12008.STG_MASTER_ROBI_DELETED(REFOG);
+
+-- Reactivation detection
+CREATE INDEX IDX_DELETED_ROBI_ACTIVE
+    ON OWN_AP12008.STG_MASTER_ROBI_DELETED(IS_REACTIVATED);
+
+--- updated stored proc SP_LOAD_STG_MASTER_ROBI
+--Phase 0: Count landing rows (guard)
+--Phase 1: Snapshot disappearing rows → STG_MASTER_ROBI_DELETED
+--Phase 2: Handle reactivations (REFOG reappears)
+--Phase 3: Truncate + reload STG_MASTER_ROBI
+--Phase 4: Audit log
+CREATE OR REPLACE PROCEDURE OWN_AP12008.SP_LOAD_STG_MASTER_ROBI
+AS
+    v_landing_count     NUMBER := 0;
+    v_inserted_count    NUMBER := 0;
+    v_rejected_count    NUMBER := 0;
+    v_duplicate_count   NUMBER := 0;
+    v_deleted_count     NUMBER := 0;
+    v_reactivated_count NUMBER := 0;
+    v_start_time        TIMESTAMP := SYSTIMESTAMP;
+
+BEGIN
+
+    -- ----------------------------------------------------------------
+    -- PHASE 0: Guard — landing table must not be empty
+    -- ----------------------------------------------------------------
+    SELECT COUNT(*) INTO v_landing_count
+    FROM OWN_AP12008.STG_MASTER_ROBI_LANDING;
+
+    IF v_landing_count = 0 THEN
+        RAISE_APPLICATION_ERROR(
+            -20001,
+            'SP_LOAD_STG_MASTER_ROBI: Landing table is empty. Aborting.'
+        );
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- PHASE 1: Snapshot disappearing rows into STG_MASTER_ROBI_DELETED
+    -- These are REFOGs present in STG_MASTER_ROBI today
+    -- but missing from today's landing file
+    -- Must happen BEFORE truncate — this is the last chance
+    -- to capture their full record
+    -- ----------------------------------------------------------------
+
+    -- 1a: Insert new deletions (not previously deleted)
+    INSERT INTO OWN_AP12008.STG_MASTER_ROBI_DELETED (
+        ROBID, FLID, START_DATE, END_DATE,
+        ENTITYID, ENTITY, MANAGER,
+        LASTNAME, FIRSTNAME,
+        COUNTRY, LANGUAGE,
+        FUNCTION, REFOG, EMAIL,
+        TYPE, STATUS,
+        ISTEST, ISRPA, USER_TYPE,
+        LAST_BATCH_DATE, DELETED_ON,
+        IS_REACTIVATED
+    )
+    SELECT
+        m.ROBID, m.FLID, m.START_DATE, m.END_DATE,
+        m.ENTITYID, m.ENTITY, m.MANAGER,
+        m.LASTNAME, m.FIRSTNAME,
+        m.COUNTRY, m.LANGUAGE,
+        m.FUNCTION, m.REFOG, m.EMAIL,
+        m.TYPE, m.STATUS,
+        m.ISTEST, m.ISRPA, m.USER_TYPE,
+        m.BATCH_DATE,
+        SYSTIMESTAMP,
+        'N'
+    FROM OWN_AP12008.STG_MASTER_ROBI m
+    WHERE m.REFOG IS NOT NULL
+      -- Missing from today's landing file
+      AND NOT EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI_LANDING l
+          WHERE NVL(l.REFOG, l.FLID) = m.REFOG
+      )
+      -- Not already in deleted table
+      AND NOT EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI_DELETED d
+          WHERE d.REFOG = m.REFOG
+            AND d.IS_REACTIVATED = 'N'
+      );
+
+    v_deleted_count := SQL%ROWCOUNT;
+
+    -- ----------------------------------------------------------------
+    -- PHASE 2: Handle reactivations
+    -- REFOG was previously deleted but reappears in today's landing
+    -- Like a rehired employee returning to the building
+    -- ----------------------------------------------------------------
+    UPDATE OWN_AP12008.STG_MASTER_ROBI_DELETED d
+    SET
+        d.IS_REACTIVATED  = 'Y',
+        d.REACTIVATED_ON  = SYSTIMESTAMP
+    WHERE d.IS_REACTIVATED = 'N'
+      AND EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI_LANDING l
+          WHERE NVL(l.REFOG, l.FLID) = d.REFOG
+      );
+
+    v_reactivated_count := SQL%ROWCOUNT;
+
+    -- ----------------------------------------------------------------
+    -- PHASE 3: Truncate + reload STG_MASTER_ROBI
+    -- Safe to truncate now — deletions are archived
+    -- ----------------------------------------------------------------
+    EXECUTE IMMEDIATE 'TRUNCATE TABLE OWN_AP12008.STG_MASTER_ROBI';
+
+    INSERT INTO OWN_AP12008.STG_MASTER_ROBI (
+        ROBID, FLID, START_DATE, END_DATE,
+        ENTITYID, ENTITY, MANAGER,
+        LASTNAME, FIRSTNAME,
+        COUNTRY, LANGUAGE,
+        FUNCTION, REFOG, EMAIL,
+        TYPE, STATUS,
+        ISTEST, ISRPA,
+        USER_TYPE, BATCH_DATE, LOADED_BY
+    )
+    SELECT
+        ROBID, FLID, START_DATE, END_DATE,
+        ENTITYID, ENTITY, MANAGER,
+        LASTNAME, FIRSTNAME,
+        COUNTRY, LANGUAGE,
+        FUNCTION, REFOG, EMAIL,
+        TYPE, STATUS,
+        ISTEST, ISRPA,
+        'PERSONAL'                          AS USER_TYPE,
+        SYSDATE                             AS BATCH_DATE,
+        SYS_CONTEXT('USERENV', 'OS_USER')   AS LOADED_BY
+    FROM (
+        SELECT l.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY l.ROBID
+                   ORDER BY
+                       TO_DATE(l.START_DATE,'DD/MM/YYYY HH24:MI:SS') DESC
+               ) AS RN
+        FROM OWN_AP12008.STG_MASTER_ROBI_LANDING l
+        WHERE l.ROBID IS NOT NULL
+          AND NVL(l.FLID, l.REFOG) IS NOT NULL
+    )
+    WHERE RN = 1;
+
+    v_inserted_count := SQL%ROWCOUNT;
+
+    -- Rejection count
+    SELECT COUNT(*) INTO v_rejected_count
+    FROM OWN_AP12008.STG_MASTER_ROBI_LANDING
+    WHERE ROBID IS NULL
+       OR NVL(FLID, REFOG) IS NULL;
+
+    v_duplicate_count := v_landing_count
+                         - v_inserted_count
+                         - v_rejected_count;
+
+    -- ----------------------------------------------------------------
+    -- PHASE 4: Commit atomically
+    -- ----------------------------------------------------------------
+    COMMIT;
+
+    DBMS_OUTPUT.PUT_LINE('=== SP_LOAD_STG_MASTER_ROBI ===');
+    DBMS_OUTPUT.PUT_LINE('Start time   : ' || TO_CHAR(v_start_time, 'DD/MM/YYYY HH24:MI:SS'));
+    DBMS_OUTPUT.PUT_LINE('End time     : ' || TO_CHAR(SYSTIMESTAMP, 'DD/MM/YYYY HH24:MI:SS'));
+    DBMS_OUTPUT.PUT_LINE('Landing rows : ' || v_landing_count);
+    DBMS_OUTPUT.PUT_LINE('Inserted     : ' || v_inserted_count);
+    DBMS_OUTPUT.PUT_LINE('Rejected     : ' || v_rejected_count);
+    DBMS_OUTPUT.PUT_LINE('Duplicates   : ' || v_duplicate_count);
+    DBMS_OUTPUT.PUT_LINE('Deleted      : ' || v_deleted_count);
+    DBMS_OUTPUT.PUT_LINE('Reactivated  : ' || v_reactivated_count);
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        DBMS_OUTPUT.PUT_LINE('ERROR: ' || SQLERRM);
+        RAISE;
+END SP_LOAD_STG_MASTER_ROBI;
+/
+
+---update view
+
+CREATE OR REPLACE FORCE EDITIONABLE VIEW "OWN_AP12008"."IDENTITY_AUTH_SOURCE_VW"
+(
+    "ROBID", "FLID", "REFOG", "START_DATE", "END_DATE",
+    "ENTITYID", "ENTITY", "MANAGER",
+    "LASTNAME", "FIRSTNAME",
+    "COUNTRY", "LANGUAGE", "FUNCTION",
+    "JOB_TITLE", "EMAIL",
+    "TYPE", "INACTIVE_STATUS",
+    "ISTEST", "ISRPA",
+    "IDENTITY_SOURCE", "IS_MANAGER",
+    "USER_TYPE", "RECORD_STATUS",
+    "LAST_UPDATE_DATE", "LOADED_BY"
+) AS
+-- ----------------------------------------------------------------
+-- Branch 1: Active identities
+-- ----------------------------------------------------------------
+SELECT
+    main.ROBID,
+    main.FLID,
+    NVL(main.REFOG, main.FLID)          AS REFOG,
+    main.START_DATE,
+    main.END_DATE,
+    main.ENTITYID,
+    main.ENTITY,
+    main.MANAGER,
+    main.LASTNAME,
+    main.FIRSTNAME,
+    main.COUNTRY,
+    main.LANGUAGE,
+    main.FUNCTION,
+    (CASE
+        WHEN main.FUNCTION IS NOT NULL
+        THEN sjf.JOB_FUNCTION_ID || ': ' || sjf.JOB_DESC_EN
+        ELSE main.FUNCTION
+    END)                                AS JOB_TITLE,
+    main.EMAIL,
+    (CASE UPPER(main.TYPE)
+        WHEN 'I'  THEN 'employee'
+        WHEN 'E'  THEN 'contractor'
+        WHEN 'S'  THEN 'service'
+        WHEN 'SY' THEN 'system'
+    END)                                AS TYPE,
+    (CASE UPPER(main.STATUS)
+        WHEN 'A' THEN 'false'
+        WHEN 'I' THEN 'true'
+    END)                                AS INACTIVE_STATUS,
+    main.ISTEST,
+    main.ISRPA,
+    (CASE
+        WHEN main.REFOG IS NULL THEN 'FLID'
+        ELSE 'REFOG'
+    END)                                AS IDENTITY_SOURCE,
+    NVL(imv.IS_MANAGER, 'N')            AS IS_MANAGER,
+    main.USER_TYPE,
+    'ACTIVE'                            AS RECORD_STATUS,
+    main.BATCH_DATE                     AS LAST_UPDATE_DATE,
+    main.LOADED_BY
+FROM OWN_AP12008.STG_MASTER_ROBI main
+LEFT JOIN OWN_AP12008.IS_MANAGER_VW   imv
+    ON imv.ROBID   = main.ROBID
+LEFT JOIN OWN_AP12008.JOB_FUNCTION_VW sjf
+    ON sjf.JOB_FUNCTION_ID = main.FUNCTION
+
+UNION ALL
+
+-- ----------------------------------------------------------------
+-- Branch 2: Deleted identities — ghost records
+-- Forced inactive so IIQ triggers Leaver workflow
+-- Only IS_REACTIVATED = 'N' — reactivated ones
+-- are already back in Branch 1
+-- ----------------------------------------------------------------
+SELECT
+    d.ROBID,
+    d.FLID,
+    d.REFOG,
+    d.START_DATE,
+    d.END_DATE,
+    d.ENTITYID,
+    d.ENTITY,
+    d.MANAGER,
+    d.LASTNAME,
+    d.FIRSTNAME,
+    d.COUNTRY,
+    d.LANGUAGE,
+    d.FUNCTION,
+    NULL                                AS JOB_TITLE,
+    d.EMAIL,
+    (CASE UPPER(d.TYPE)
+        WHEN 'I'  THEN 'employee'
+        WHEN 'E'  THEN 'contractor'
+        WHEN 'S'  THEN 'service'
+        WHEN 'SY' THEN 'system'
+    END)                                AS TYPE,
+    'true'                              AS INACTIVE_STATUS, -- forced inactive
+    d.ISTEST,
+    d.ISRPA,
+    (CASE
+        WHEN d.REFOG IS NULL THEN 'FLID'
+        ELSE 'REFOG'
+    END)                                AS IDENTITY_SOURCE,
+    'N'                                 AS IS_MANAGER, -- no longer a manager
+    d.USER_TYPE,
+    'DELETED'                           AS RECORD_STATUS,
+    d.DELETED_ON                        AS LAST_UPDATE_DATE,
+    'SYSTEM'                            AS LOADED_BY
+FROM OWN_AP12008.STG_MASTER_ROBI_DELETED d
+WHERE d.IS_REACTIVATED = 'N';
+
+---- update delta aggreagation SQL in IIQ
+
+SELECT REFOG
+FROM OWN_AP12008.STG_MASTER_ROBI_DELTA
+WHERE IS_PROCESSED = 'N'
+
+-------- COMPLETE INVENTORY for check
 
