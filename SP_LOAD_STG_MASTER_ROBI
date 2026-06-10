@@ -1,1 +1,171 @@
+CREATE OR REPLACE PROCEDURE OWN_AP12008.SP_LOAD_STG_MASTER_ROBI
+AS
+    v_landing_count     NUMBER := 0;
+    v_inserted_count    NUMBER := 0;
+    v_rejected_count    NUMBER := 0;
+    v_duplicate_count   NUMBER := 0;
+    v_deleted_count     NUMBER := 0;
+    v_reactivated_count NUMBER := 0;
+    v_start_time        TIMESTAMP := SYSTIMESTAMP;
 
+BEGIN
+
+    -- ----------------------------------------------------------------
+    -- PHASE 0: Guard — landing table must not be empty
+    -- ----------------------------------------------------------------
+    SELECT COUNT(*)
+    INTO v_landing_count
+    FROM OWN_AP12008.STG_MASTER_ROBI_LANDING;
+
+    IF v_landing_count = 0 THEN
+        RAISE_APPLICATION_ERROR(
+            -20001,
+            'SP_LOAD_STG_MASTER_ROBI: Landing table is empty. Aborting.'
+        );
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- PHASE 1: Snapshot disappearing rows into STG_MASTER_ROBI_DELETED
+    -- Must happen BEFORE truncate — last chance to capture full record
+    -- Compare current main table against today's landing file
+    -- Using NVL(REFOG, FLID) as effective identity key on both sides
+    -- ----------------------------------------------------------------
+
+    -- 1a: Insert new deletions
+    -- REFOGs active in STG_MASTER_ROBI but missing from today's landing
+    INSERT INTO OWN_AP12008.STG_MASTER_ROBI_DELETED (
+        ROBID, FLID, START_DATE, END_DATE,
+        ENTITYID, ENTITY, MANAGER,
+        LASTNAME, FIRSTNAME,
+        COUNTRY, LANGUAGE,
+        FUNCTION, REFOG, EMAIL,
+        TYPE, STATUS,
+        ISTEST, ISRPA, USER_TYPE,
+        LAST_BATCH_DATE, DELETED_ON,
+        IS_REACTIVATED
+    )
+    SELECT
+        m.ROBID, m.FLID, m.START_DATE, m.END_DATE,
+        m.ENTITYID, m.ENTITY, m.MANAGER,
+        m.LASTNAME, m.FIRSTNAME,
+        m.COUNTRY, m.LANGUAGE,
+        m.FUNCTION, m.REFOG, m.EMAIL,
+        m.TYPE, m.STATUS,
+        m.ISTEST, m.ISRPA, m.USER_TYPE,
+        m.BATCH_DATE,
+        SYSTIMESTAMP,
+        'N'
+    FROM OWN_AP12008.STG_MASTER_ROBI m
+    WHERE NVL(m.REFOG, m.FLID) IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI_LANDING l
+          WHERE NVL(l.REFOG, l.FLID) = NVL(m.REFOG, m.FLID)
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI_DELETED d
+          WHERE d.REFOG          = NVL(m.REFOG, m.FLID)
+            AND d.IS_REACTIVATED = 'N'
+      );
+
+    v_deleted_count := SQL%ROWCOUNT;
+
+    -- ----------------------------------------------------------------
+    -- PHASE 2: Handle reactivations
+    -- Effective REFOG previously deleted but back in today's landing
+    -- ----------------------------------------------------------------
+    UPDATE OWN_AP12008.STG_MASTER_ROBI_DELETED d
+    SET
+        d.IS_REACTIVATED = 'Y',
+        d.REACTIVATED_ON = SYSTIMESTAMP
+    WHERE d.IS_REACTIVATED = 'N'
+      AND EXISTS (
+          SELECT 1
+          FROM OWN_AP12008.STG_MASTER_ROBI_LANDING l
+          WHERE NVL(l.REFOG, l.FLID) = d.REFOG
+      );
+
+    v_reactivated_count := SQL%ROWCOUNT;
+
+    -- ----------------------------------------------------------------
+    -- PHASE 3: Truncate + reload STG_MASTER_ROBI
+    -- Safe to truncate now — deletions archived in PHASE 1
+    -- ----------------------------------------------------------------
+    EXECUTE IMMEDIATE 'TRUNCATE TABLE OWN_AP12008.STG_MASTER_ROBI';
+
+    INSERT INTO OWN_AP12008.STG_MASTER_ROBI (
+        ROBID, FLID, START_DATE, END_DATE,
+        ENTITYID, ENTITY, MANAGER,
+        LASTNAME, FIRSTNAME,
+        COUNTRY, LANGUAGE,
+        FUNCTION, REFOG, EMAIL,
+        TYPE, STATUS,
+        ISTEST, ISRPA,
+        USER_TYPE, BATCH_DATE, LOADED_BY
+    )
+    SELECT
+        ROBID, FLID, START_DATE, END_DATE,
+        ENTITYID, ENTITY, MANAGER,
+        LASTNAME, FIRSTNAME,
+        COUNTRY, LANGUAGE,
+        FUNCTION, REFOG, EMAIL,
+        TYPE, STATUS,
+        ISTEST, ISRPA,
+        'PERSONAL'                          AS USER_TYPE,
+        SYSDATE                             AS BATCH_DATE,
+        SYS_CONTEXT('USERENV', 'OS_USER')   AS LOADED_BY
+    FROM (
+        SELECT
+            l.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY NVL(l.ROBID, NVL(l.REFOG, l.FLID))
+                ORDER BY
+                    TO_DATE(l.START_DATE, 'DD/MM/YYYY HH24:MI:SS') DESC
+            ) AS RN
+        FROM OWN_AP12008.STG_MASTER_ROBI_LANDING l
+        WHERE l.ROBID IS NOT NULL
+          AND NVL(l.REFOG, l.FLID) IS NOT NULL
+    )
+    WHERE RN = 1;
+
+    v_inserted_count := SQL%ROWCOUNT;
+
+    -- ----------------------------------------------------------------
+    -- PHASE 4: Count rejections for audit
+    -- ----------------------------------------------------------------
+    SELECT COUNT(*)
+    INTO v_rejected_count
+    FROM OWN_AP12008.STG_MASTER_ROBI_LANDING
+    WHERE ROBID IS NULL
+       OR NVL(REFOG, FLID) IS NULL;
+
+    v_duplicate_count := v_landing_count
+                         - v_inserted_count
+                         - v_rejected_count;
+
+    -- ----------------------------------------------------------------
+    -- PHASE 5: Commit all changes atomically
+    -- ----------------------------------------------------------------
+    COMMIT;
+
+    -- ----------------------------------------------------------------
+    -- PHASE 6: Audit output
+    -- ----------------------------------------------------------------
+    DBMS_OUTPUT.PUT_LINE('=== SP_LOAD_STG_MASTER_ROBI ===');
+    DBMS_OUTPUT.PUT_LINE('Start time   : ' || TO_CHAR(v_start_time, 'DD/MM/YYYY HH24:MI:SS'));
+    DBMS_OUTPUT.PUT_LINE('End time     : ' || TO_CHAR(SYSTIMESTAMP, 'DD/MM/YYYY HH24:MI:SS'));
+    DBMS_OUTPUT.PUT_LINE('Landing rows : ' || v_landing_count);
+    DBMS_OUTPUT.PUT_LINE('Inserted     : ' || v_inserted_count);
+    DBMS_OUTPUT.PUT_LINE('Rejected     : ' || v_rejected_count);
+    DBMS_OUTPUT.PUT_LINE('Duplicates   : ' || v_duplicate_count);
+    DBMS_OUTPUT.PUT_LINE('Deleted      : ' || v_deleted_count);
+    DBMS_OUTPUT.PUT_LINE('Reactivated  : ' || v_reactivated_count);
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        DBMS_OUTPUT.PUT_LINE('ERROR: ' || SQLERRM);
+        RAISE;
+END SP_LOAD_STG_MASTER_ROBI;
+/
