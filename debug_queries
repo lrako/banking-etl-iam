@@ -23,3 +23,28 @@ LEFT JOIN OWN_AP12008.STG_MASTER_ROBI r
 WHERE d.CHANGE_TYPE  = 'DELETED'
   AND d.IS_PROCESSED = 'N'
   AND ROWNUM <= 20;
+
+
+-- Confirm exact mismatch
+SELECT h.REFOG, r.ROBID, r.REFOG AS RAW_REFOG, r.FLID,
+       NVL(r.REFOG, r.FLID) AS COMPUTED_KEY
+FROM OWN_AP12008.STG_MASTER_ROBI_HASH h
+JOIN OWN_AP12008.STG_MASTER_ROBI r
+    ON r.FLID = h.REFOG      -- join on FLID directly
+WHERE h.IS_ACTIVE = 'Y'
+  AND r.REFOG IS NULL        -- only FLID-resolved rows
+  AND NVL(r.REFOG, r.FLID) != h.REFOG  -- where NVL doesn't match hash
+  AND ROWNUM <= 10;
+
+-- Check for trailing spaces or case differences
+SELECT h.REFOG, 
+       LENGTH(h.REFOG) AS HASH_LEN,
+       r.FLID, 
+       LENGTH(r.FLID) AS FLID_LEN,
+       DUMP(h.REFOG) AS HASH_DUMP,
+       DUMP(r.FLID)  AS FLID_DUMP
+FROM OWN_AP12008.STG_MASTER_ROBI_HASH h
+JOIN OWN_AP12008.STG_MASTER_ROBI r ON r.FLID = h.REFOG
+WHERE h.IS_ACTIVE = 'Y'
+  AND r.REFOG IS NULL
+  AND ROWNUM <= 3;
