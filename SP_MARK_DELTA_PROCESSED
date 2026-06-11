@@ -44,3 +44,38 @@ EXCEPTION
         RAISE;
 END SP_MARK_DELTA_PROCESSED;
 /
+--- IIQ setup beanshell postIterate
+
+// Rule Type: IteratorRule (postIterate)
+// Name: Rule-PostIterate-MarkDeltaProcessed
+
+import java.sql.Connection;
+import java.sql.CallableStatement;
+
+Connection conn = null;
+CallableStatement cs = null;
+
+try {
+    // Get connection from the application's connection pool
+    conn = application.getConnection();
+    
+    cs = conn.prepareCall(
+        "{ call OWN_AP12008.SP_MARK_DELTA_PROCESSED() }"
+    );
+    cs.execute();
+    conn.commit();
+    
+    log.debug("Rule-PostIterate-MarkDeltaProcessed: " +
+              "Delta rows marked as processed successfully.");
+
+} catch (Exception e) {
+    log.error("Rule-PostIterate-MarkDeltaProcessed: " +
+              "Failed to mark delta processed: " + e.getMessage());
+    throw e;
+    
+} finally {
+    if (cs   != null) try { cs.close();   } catch (Exception e) {}
+    if (conn != null) try { conn.close();  } catch (Exception e) {}
+}
+
+return null;
