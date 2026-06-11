@@ -1,0 +1,46 @@
+CREATE OR REPLACE PROCEDURE OWN_AP12008.SP_MARK_DELTA_PROCESSED
+AS
+    v_updated_count  NUMBER := 0;
+    v_start_time     TIMESTAMP := SYSTIMESTAMP;
+
+BEGIN
+
+    -- ----------------------------------------------------------------
+    -- Mark all unprocessed delta rows as processed
+    -- Called by Control-M AFTER IIQ delta aggregation
+    -- confirms successful completion
+    -- Think of it as the hotel checkout stamp —
+    -- IIQ has processed these identities,
+    -- now we archive the record of that processing
+    -- It must run AFTER the aggregation and before Identity Refresh
+    -- ----------------------------------------------------------------
+    UPDATE OWN_AP12008.STG_MASTER_ROBI_DELTA
+    SET
+        IS_PROCESSED  = 'Y',
+        PROCESSED_ON  = SYSTIMESTAMP,
+        PROCESSED_BY  = SYS_CONTEXT('USERENV', 'OS_USER')
+    WHERE IS_PROCESSED = 'N';
+
+    v_updated_count := SQL%ROWCOUNT;
+
+    IF v_updated_count = 0 THEN
+        DBMS_OUTPUT.PUT_LINE(
+            'SP_MARK_DELTA_PROCESSED: Warning - ' ||
+            'No unprocessed rows found. Delta table already clean.'
+        );
+    END IF;
+
+    COMMIT;
+
+    DBMS_OUTPUT.PUT_LINE('=== SP_MARK_DELTA_PROCESSED ===');
+    DBMS_OUTPUT.PUT_LINE('Start time : ' || TO_CHAR(v_start_time,  'DD/MM/YYYY HH24:MI:SS'));
+    DBMS_OUTPUT.PUT_LINE('End time   : ' || TO_CHAR(SYSTIMESTAMP,  'DD/MM/YYYY HH24:MI:SS'));
+    DBMS_OUTPUT.PUT_LINE('Marked     : ' || v_updated_count);
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        DBMS_OUTPUT.PUT_LINE('ERROR: ' || SQLERRM);
+        RAISE;
+END SP_MARK_DELTA_PROCESSED;
+/
