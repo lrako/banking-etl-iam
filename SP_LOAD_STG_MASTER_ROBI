@@ -1,4 +1,9 @@
-CREATE OR REPLACE PROCEDURE OWN_AP12008.SP_LOAD_STG_MASTER_ROBI
+create or replace PROCEDURE             SP_LOAD_STG_MASTER_ROBI
+--Phase 0: Count landing rows (guard)
+--Phase 1: Snapshot disappearing rows -> STG_MASTER_ROBI_DELETED
+--Phase 2: Handle reactivations (REFOG reappears)
+--Phase 3: Truncate + reload STG_MASTER_ROBI
+--Phase 4: Audit log
 AS
     v_landing_count     NUMBER := 0;
     v_inserted_count    NUMBER := 0;
@@ -168,4 +173,3 @@ EXCEPTION
         DBMS_OUTPUT.PUT_LINE('ERROR: ' || SQLERRM);
         RAISE;
 END SP_LOAD_STG_MASTER_ROBI;
-/
