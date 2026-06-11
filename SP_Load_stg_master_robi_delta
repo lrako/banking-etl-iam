@@ -1,50 +1,4 @@
-CREATE OR REPLACE FUNCTION OWN_AP12008.FN_COMPUTE_HASH(
-    p_robid     VARCHAR2,
-    p_flid      VARCHAR2,
-    p_start_dt  VARCHAR2,
-    p_end_dt    VARCHAR2,
-    p_entityid  VARCHAR2,
-    p_entity    VARCHAR2,
-    p_manager   VARCHAR2,
-    p_lastname  VARCHAR2,
-    p_firstname VARCHAR2,
-    p_country   VARCHAR2,
-    p_language  VARCHAR2,
-    p_function  VARCHAR2,
-    p_email     VARCHAR2,
-    p_type      VARCHAR2,
-    p_status    VARCHAR2,
-    p_istest    VARCHAR2,
-    p_isrpa     VARCHAR2,
-    p_usertype  VARCHAR2
-) RETURN NUMBER
-IS
-BEGIN
-    RETURN ORA_HASH(
-        p_robid     || '|' ||
-        p_flid      || '|' ||
-        p_start_dt  || '|' ||
-        p_end_dt    || '|' ||
-        p_entityid  || '|' ||
-        p_entity    || '|' ||
-        p_manager   || '|' ||
-        p_lastname  || '|' ||
-        p_firstname || '|' ||
-        p_country   || '|' ||
-        p_language  || '|' ||
-        p_function  || '|' ||
-        p_email     || '|' ||
-        p_type      || '|' ||
-        p_status    || '|' ||
-        p_istest    || '|' ||
-        p_isrpa     || '|' ||
-        p_usertype
-    );
-END FN_COMPUTE_HASH;
-/
-
-
-CREATE OR REPLACE PROCEDURE OWN_AP12008.SP_LOAD_STG_MASTER_ROBI_DELTA
+create or replace PROCEDURE             SP_LOAD_STG_MASTER_ROBI_DELTA
 AS
     v_current_batch_date    DATE;
     v_count_new             NUMBER := 0;
@@ -268,6 +222,3 @@ EXCEPTION
         DBMS_OUTPUT.PUT_LINE('ERROR: ' || SQLERRM);
         RAISE;
 END SP_LOAD_STG_MASTER_ROBI_DELTA;
-/
-
-----
