@@ -1,0 +1,58 @@
+import java.util.HashMap;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+
+Log log = LogFactory.getLog("rule.SAMLCorrelation.MyFortisAccess");
+
+// 1. Pull the NameID the IdP sent. MUST be lowercase "nameId".
+String nameId = (String) assertionAttributes.get("nameId");
+log.debug("SAML correlation - incoming nameId = " + nameId);
+
+HashMap returnMap = new HashMap();
+
+if (nameId != null && nameId.trim().length() > 0) {
+    // 2. Tell IIQ which Identity property to match against, and the value.
+    //    This is your JOIN key: Identity.uid = <nameId from assertion>
+    returnMap.put("identityAttributeName", "uid");
+    returnMap.put("identityAttributeValue", nameId.trim());
+} else {
+    log.error("SAML correlation - no nameId in assertion; cannot correlate");
+}
+
+return returnMap;
+
+--------------
+
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE Rule PUBLIC "sailpoint.dtd" "sailpoint.dtd">
+<Rule language="beanshell" name="MyFortisAccess SAML Correlation" type="SAMLCorrelation">
+  <Description>
+    Correlates an incoming SAML assertion to an IIQ Identity by matching
+    the assertion's nameId against the Identity 'uid' attribute.
+  </Description>
+  <Source>
+  <![CDATA[
+    import java.util.HashMap;
+    import org.apache.commons.logging.Log;
+    import org.apache.commons.logging.LogFactory;
+
+    Log log = LogFactory.getLog("rule.SAMLCorrelation.MyFortisAccess");
+
+    // The IdP sends the user's uid as the NameID. Key MUST be lowercase "nameId".
+    String nameId = (String) assertionAttributes.get("nameId");
+    log.debug("SAML correlation - incoming nameId = " + nameId);
+
+    HashMap returnMap = new HashMap();
+
+    if (nameId != null && nameId.trim().length() > 0) {
+        // Tell IIQ: find the Identity whose 'uid' equals this nameId.
+        returnMap.put("identityAttributeName",  "uid");
+        returnMap.put("identityAttributeValue", nameId.trim());
+    } else {
+        log.error("SAML correlation - no nameId in assertion; cannot correlate user");
+    }
+
+    return returnMap;
+  ]]>
+  </Source>
+</Rule>
