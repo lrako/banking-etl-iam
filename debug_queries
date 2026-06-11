@@ -1,82 +1,19 @@
--- Query 1: How many rows in hash table after the run?
+-- Query A: Full delta table state
+SELECT CHANGE_TYPE, IS_PROCESSED, BATCH_DATE, COUNT(*)
+FROM OWN_AP12008.STG_MASTER_ROBI_DELTA
+GROUP BY CHANGE_TYPE, IS_PROCESSED, BATCH_DATE
+ORDER BY BATCH_DATE;
+
+-- Query B: Are June 10 and June 11 rows both present?
+SELECT COUNT(*) AS TOTAL_ROWS,
+       COUNT(DISTINCT REFOG) AS DISTINCT_REFOGS,
+       MIN(BATCH_DATE) AS EARLIEST,
+       MAX(BATCH_DATE) AS LATEST
+FROM OWN_AP12008.STG_MASTER_ROBI_DELTA
+WHERE CHANGE_TYPE = 'NEW'
+  AND IS_PROCESSED = 'N';
+
+-- Query C: Check hash table state
 SELECT IS_ACTIVE, COUNT(*)
 FROM OWN_AP12008.STG_MASTER_ROBI_HASH
 GROUP BY IS_ACTIVE;
-
--- Query 2: Are the 15225 DELETED REFOGs 
--- actually present in STG_MASTER_ROBI?
-SELECT COUNT(*)
-FROM OWN_AP12008.STG_MASTER_ROBI_DELTA d
-WHERE d.CHANGE_TYPE = 'DELETED'
-  AND d.IS_PROCESSED = 'N'
-  AND EXISTS (
-      SELECT 1
-      FROM OWN_AP12008.STG_MASTER_ROBI r
-      WHERE NVL(r.REFOG, r.FLID) = d.REFOG
-  );
-
--- Query 3: Sample the 15225 to see what they look like
-SELECT d.REFOG, r.ROBID, r.REFOG, r.FLID
-FROM OWN_AP12008.STG_MASTER_ROBI_DELTA d
-LEFT JOIN OWN_AP12008.STG_MASTER_ROBI r
-    ON NVL(r.REFOG, r.FLID) = d.REFOG
-WHERE d.CHANGE_TYPE  = 'DELETED'
-  AND d.IS_PROCESSED = 'N'
-  AND ROWNUM <= 20;
-
-
--- Confirm exact mismatch
-SELECT h.REFOG, r.ROBID, r.REFOG AS RAW_REFOG, r.FLID,
-       NVL(r.REFOG, r.FLID) AS COMPUTED_KEY
-FROM OWN_AP12008.STG_MASTER_ROBI_HASH h
-JOIN OWN_AP12008.STG_MASTER_ROBI r
-    ON r.FLID = h.REFOG      -- join on FLID directly
-WHERE h.IS_ACTIVE = 'Y'
-  AND r.REFOG IS NULL        -- only FLID-resolved rows
-  AND NVL(r.REFOG, r.FLID) != h.REFOG  -- where NVL doesn't match hash
-  AND ROWNUM <= 10;
-
--- Check for trailing spaces or case differences
-SELECT h.REFOG, 
-       LENGTH(h.REFOG) AS HASH_LEN,
-       r.FLID, 
-       LENGTH(r.FLID) AS FLID_LEN,
-       DUMP(h.REFOG) AS HASH_DUMP,
-       DUMP(r.FLID)  AS FLID_DUMP
-FROM OWN_AP12008.STG_MASTER_ROBI_HASH h
-JOIN OWN_AP12008.STG_MASTER_ROBI r ON r.FLID = h.REFOG
-WHERE h.IS_ACTIVE = 'Y'
-  AND r.REFOG IS NULL
-  AND ROWNUM <= 3;
-
-
-
-SELECT COUNT(*)
-FROM OWN_AP12008.STG_MASTER_ROBI_HASH h
-WHERE h.IS_ACTIVE = 'Y'
-AND NOT EXISTS (
-    SELECT 1 FROM OWN_AP12008.STG_MASTER_ROBI r
-    WHERE NVL(r.REFOG, r.FLID) = h.REFOG
-);
-
-
-I suspect this returns 15225 — meaning the NOT EXISTS is genuinely failing to find those rows. Then run:
-
--- Check if FLID-only rows resolve correctly standalone
-SELECT COUNT(*)
-FROM OWN_AP12008.STG_MASTER_ROBI
-WHERE REFOG IS NULL
-AND FLID IS NOT NULL;
-
--- Check if hash has those FLID values
-SELECT COUNT(*)
-FROM OWN_AP12008.STG_MASTER_ROBI_HASH h
-WHERE NOT EXISTS (
-    SELECT 1 FROM OWN_AP12008.STG_MASTER_ROBI r
-    WHERE r.FLID = h.REFOG
-    AND r.REFOG IS NULL
-);
-
-
- new hypothesis: the hash stores X07224 (from FLID), but STG_MASTER_ROBI has a different ROBID format like 00507224 for those rows — and NVL(r.REFOG, r.FLID) for those rows returns X07224 correctly... but wait, Query 2 already confirmed 15225 exist via NVL.
-This points to one thing: the STEP 4 NOT EXISTS is being evaluated against the state of STG_MASTER_ROBI_HASH before STEP 2b committed — but since we're in the same transaction with no intermediate commit, Oracle should see the STEP 2b inserts.
