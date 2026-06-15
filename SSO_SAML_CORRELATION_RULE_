@@ -1,25 +1,41 @@
-import java.util.HashMap;
+import sailpoint.object.Identity;
+import sailpoint.object.QueryOptions;
+import sailpoint.object.Filter;
+import java.util.Iterator;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
-Log log = LogFactory.getLog("rule.SAMLCorrelation.MyFortisAccess");
+Log log = LogFactory.getLog("rule.SAMLCorrelation.SailpointSSO");
 
 // 1. Pull the NameID the IdP sent. MUST be lowercase "nameId".
 String nameId = (String) assertionAttributes.get("nameId");
 log.debug("SAML correlation - incoming nameId = " + nameId);
 
-HashMap returnMap = new HashMap();
+Identity ident = null;
 
 if (nameId != null && nameId.trim().length() > 0) {
-    // 2. Tell IIQ which Identity property to match against, and the value.
-    //    This is your JOIN key: Identity.uid = <nameId from assertion>
-    returnMap.put("identityAttributeName", "uid");
-    returnMap.put("identityAttributeValue", nameId.trim());
+    // 2. Find the Identity whose 'uid' equals this nameId. JOIN key: Identity.uid = nameId
+    QueryOptions qo = new QueryOptions();
+    qo.addFilter(Filter.eq("uid", nameId.trim()));
+
+    Iterator it = context.search(Identity.class, qo);
+    if (it != null && it.hasNext()) {
+        String id = (String) ((Object[]) it.next())[0];   // first match's id
+        ident = context.getObjectById(Identity.class, id);
+    }
+    // release the search iterator
+    sailpoint.api.IdIterator.closeIfNeeded(it);
+
+    if (ident == null) {
+        log.warn("SAML correlation - no Identity found with uid = " + nameId.trim());
+    }
 } else {
     log.error("SAML correlation - no nameId in assertion; cannot correlate");
 }
 
-return returnMap;
+// 3. Return the Identity object (or null). Matches rule return type: identity Or Link.
+return ident;
+
 
 --------------
 
