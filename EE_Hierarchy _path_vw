@@ -1,0 +1,12 @@
+CREATE OR REPLACE VIEW STG_ENTERPRISE_ENTITY_PATH_VW AS
+SELECT
+    ROBID                                          AS ENTERPRISE_ENTITY_ID,
+    PARENT_ROBID                                   AS PARENT_ENTERPRISE_ENTITY_ID,
+    LTRIM(SYS_CONNECT_BY_PATH(ROBID, ';'), ';')    AS ENTERPRISE_ENTITY_PATH,
+    NAME                                           AS ENTERPRISE_ENTITY_NAME,
+    LEVEL                                          AS DEPTH,
+    CONNECT_BY_ROOT ROBID                          AS ROOT_ROBID,
+    CONNECT_BY_ROOT NAME                           AS ROOT_NAME
+FROM STG_MASTER_ENTERPRISE_ENTITY
+START WITH PARENT_ROBID IS NULL
+CONNECT BY NOCYCLE PRIOR ROBID = PARENT_ROBID;
