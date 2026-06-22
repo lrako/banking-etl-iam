@@ -1,0 +1,463 @@
+### 01_Application_BranchHR.xml
+
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE Application PUBLIC "sailpoint.dtd" "sailpoint.dtd">
+<!--
+  WORKSHOP DEMO APPLICATION - Branch HR Authoritative Source
+  Mirrors the "Proposed Model - Primary Branch Access" whiteboard.
+  Attributes:
+    entity    -> the branch/Entity in the network (BRANCH_A/B/C)
+    jobCode   -> SAP job function (CLERK / MANAGER / EXTERNAL)
+    isManager -> Y/N  (drives Manager LITR)
+    litrType  -> EMPLOYEE / MANAGER (informational; rules derive their own)
+  NOTE: update the file.path below to wherever you drop BRANCH_HR_SOURCE.csv
+-->
+<Application connector="sailpoint.connector.DelimitedFileConnector"
+             name="Branch HR Source"
+             type="DelimitedFile">
+  <Attributes>
+    <Map>
+      <entry key="file.path" value="/opt/iiq-demo/BRANCH_HR_SOURCE.csv"/>
+      <entry key="delimiter" value=","/>
+      <entry key="hasHeader" value="true"/>
+      <entry key="indexColumn" value="id"/>
+      <entry key="columnNames">
+        <value>
+          <List>
+            <String>id</String>
+            <String>firstname</String>
+            <String>lastname</String>
+            <String>entity</String>
+            <String>jobCode</String>
+            <String>isManager</String>
+            <String>litrType</String>
+          </List>
+        </value>
+      </entry>
+    </Map>
+  </Attributes>
+  <Schemas>
+    <Schema displayAttribute="id" identityAttribute="id"
+            instanceAttribute="" nativeObjectType="account"
+            objectType="account">
+      <AttributeDefinition name="id" type="string"/>
+      <AttributeDefinition name="firstname" type="string"/>
+      <AttributeDefinition name="lastname" type="string"/>
+      <AttributeDefinition name="entity" type="string"/>
+      <AttributeDefinition name="jobCode" type="string"/>
+      <AttributeDefinition name="isManager" type="string"/>
+      <AttributeDefinition name="litrType" type="string"/>
+    </Schema>
+  </Schemas>
+</Application>
+
+###--- 02_Roles_LITR
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE sailpoint PUBLIC "sailpoint.dtd" "sailpoint.dtd">
+<!--
+  WORKSHOP DEMO ROLE MODEL  (corrected)
+  ====================================================================
+  LITR = Location IT Role  -> type="it"
+  It reaches an identity by TWO paths (both modeled here on purpose):
+
+    PATH 1  DIRECT, by Enterprise Entity (EE) / branch location
+            -> the IT role carries its OWN assignment selector.
+            -> covers external EBC users who have NO job function.
+            -> IIQ tracks this as an ASSIGNED role.
+
+    PATH 2  LINKED, via a job-function Business Role
+            -> the Business Role 'requires' the LITR.
+            -> when the BR is assigned, the LITR is auto-provisioned with it.
+            -> IIQ tracks this as a REQUIRED (detected dependency) role.
+
+  Why model BOTH: on a MOVER (manager -> non-manager, same branch) the BR
+  path drops but the direct EE path keeps the LITR. Modeling LITR as
+  BR-only would create an access GAP on the mover. The dual path is what
+  makes location access stable across job changes.
+-->
+<sailpoint>
+
+  <!-- ================= LOCATION IT ROLES (LITR) ================= -->
+  <!--
+    Each LITR is type="it" AND carries an assignment Selector so it can be
+    granted DIRECTLY by Enterprise Entity (Path 1). An IT role with an
+    assignment selector is an 'assigned' IT role - supported in IIQ.
+  -->
+
+  <Bundle name="LITR-Branch-A" type="it" displayName="LITR - Location Branch A">
+    <Description>Location IT Role for Branch A. Directly assignable by EE.</Description>
+    <Selector>
+      <IdentitySelector>
+        <MatchExpression>
+          <MatchTerm name="entity" value="BRANCH_A"/>
+        </MatchExpression>
+      </IdentitySelector>
+    </Selector>
+  </Bundle>
+
+  <Bundle name="LITR-Branch-B" type="it" displayName="LITR - Location Branch B">
+    <Description>Location IT Role for Branch B. Directly assignable by EE.</Description>
+    <Selector>
+      <IdentitySelector>
+        <MatchExpression>
+          <MatchTerm name="entity" value="BRANCH_B"/>
+        </MatchExpression>
+      </IdentitySelector>
+    </Selector>
+  </Bundle>
+
+  <Bundle name="LITR-Branch-C" type="it" displayName="LITR - Location Branch C">
+    <Description>Location IT Role for Branch C. Directly assignable by EE.</Description>
+    <Selector>
+      <IdentitySelector>
+        <MatchExpression>
+          <MatchTerm name="entity" value="BRANCH_C"/>
+        </MatchExpression>
+      </IdentitySelector>
+    </Selector>
+  </Bundle>
+
+  <!-- ================= BUSINESS ROLES (job function) ================= -->
+  <!--
+    The job-function Business Role 'requires' the location LITR (Path 2).
+    'required' = auto-provisioned with the BR, no request/approval = the
+    auto-assignment behaviour the workshop wants.
+
+    DEMO NOTE on resolving the RIGHT branch:
+      A single BR cannot statically 'require' all three LITRs (that would
+      grant all branches). Two clean options:
+        (a) per-branch BR variants, each requiring its own LITR  [shown below]
+        (b) one BR + an assignment rule that adds the matching LITR by entity
+      Option (a) is shown for Branch A so the dependency is visible in the UI.
+      Option (b) is in the assignment-rule file as the scalable pattern.
+  -->
+
+  <Bundle name="BR-BranchManager-A" type="business"
+          displayName="Business Role - Branch Manager (Branch A)">
+    <Description>
+      Job-function business role for Branch A managers. Requires the Branch A
+      Location IT Role, which is therefore auto-provisioned with this BR.
+    </Description>
+    <Selector>
+      <IdentitySelector>
+        <MatchExpression and="true">
+          <MatchTerm name="isManager" value="Y"/>
+          <MatchTerm name="entity" value="BRANCH_A"/>
+        </MatchExpression>
+      </IdentitySelector>
+    </Selector>
+    <Requirements>
+      <Reference class="sailpoint.object.Bundle" name="LITR-Branch-A"/>
+    </Requirements>
+  </Bundle>
+
+  <Bundle name="BR-BranchClerk" type="business"
+          displayName="Business Role - Branch Clerk (job function)">
+    <Description>
+      Generic clerk job-function role. Demonstrates a BR that links the LITR
+      by ASSIGNMENT RULE (Path 2, scalable variant) rather than a static
+      'requires' - see Rule-Link-LITR. Left with no static requirement so the
+      rule-driven link is the visible mechanism.
+    </Description>
+    <Selector>
+      <IdentitySelector>
+        <MatchExpression>
+          <MatchTerm name="jobCode" value="CLERK"/>
+        </MatchExpression>
+      </IdentitySelector>
+    </Selector>
+  </Bundle>
+
+</sailpoint>
+###03_Rule_AssignLITR.xml
+
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE sailpoint PUBLIC "sailpoint.dtd" "sailpoint.dtd">
+<!--
+  WORKSHOP DEMO - LITR assignment rules (corrected for LITR = Location IT Role)
+  ============================================================================
+  Two rules, covering both paths and both mechanisms you asked to see.
+
+  Rule-Assign-LITR-Direct   PATH 1, BeanShell variant.
+        Same effect as the assignment Selectors on the LITRs in file 02,
+        expressed as code so the workshop can compare declarative vs scripted.
+        Grants the location LITR by Enterprise Entity alone (externals included).
+
+  Rule-Link-LITR            PATH 2, scalable BR->LITR link.
+        Instead of a static 'requires' per branch, one rule adds the LITR that
+        matches the identity's entity whenever a job-function BR is held.
+        This is the answer to the board's "multiple new rules per branch
+        opening = administrative burden": ONE rule, add an entity value.
+-->
+<sailpoint>
+
+  <!-- ===== PATH 1: direct EE assignment, BeanShell variant ===== -->
+  <Rule language="beanshell" name="Rule-Assign-LITR-Direct" type="IdentitySelector">
+    <Description>
+      Returns the Location IT Role for the identity's Enterprise Entity.
+      Entity alone - no job-function check - so external EBC users qualify.
+      Equivalent to the Selector on each LITR; shown as code for comparison.
+    </Description>
+    <Source><![CDATA[
+      import java.util.ArrayList;
+      import java.util.List;
+
+      List litrs = new ArrayList();
+      String entity = identity.getStringAttribute("entity");
+
+      if ("BRANCH_A".equals(entity)) litrs.add("LITR-Branch-A");
+      else if ("BRANCH_B".equals(entity)) litrs.add("LITR-Branch-B");
+      else if ("BRANCH_C".equals(entity)) litrs.add("LITR-Branch-C");
+
+      return litrs;
+    ]]></Source>
+  </Rule>
+
+  <!-- ===== PATH 2: BR->LITR link, scalable (one rule, all branches) ===== -->
+  <Rule language="beanshell" name="Rule-Link-LITR" type="IdentitySelector">
+    <Description>
+      When the identity holds a job-function Business Role, add the Location
+      IT Role matching its entity. One rule serves every branch: a new branch
+      opening adds one entity value, not a new rule. Mirrors the diagram's
+      red arrow (User -> Business Role -> linked LITR).
+    </Description>
+    <Source><![CDATA[
+      import java.util.ArrayList;
+      import java.util.List;
+      import sailpoint.object.Bundle;
+
+      List result = new ArrayList();
+      String entity = identity.getStringAttribute("entity");
+
+      // does the identity hold any job-function business role?
+      boolean hasJobFunctionBR = false;
+      if (identity.getAssignedRoles() != null) {
+          for (Bundle b : identity.getAssignedRoles()) {
+              if ("business".equals(b.getType())) { hasJobFunctionBR = true; break; }
+          }
+      }
+
+      if (hasJobFunctionBR && entity != null) {
+          result.add("LITR-" + entity.replace("BRANCH_", "Branch-"));
+      }
+      return result;
+    ]]></Source>
+  </Rule>
+
+</sailpoint>
+---04_Scopes_and_populations.xml
+
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE sailpoint PUBLIC "sailpoint.dtd" "sailpoint.dtd">
+<!--
+  WORKSHOP DEMO - The mobility / scoping tradeoff (the orange-flag risk)
+  ====================================================================
+  The board's tension:
+    "If LITR is scoped to Entity of the branch then no people from outside
+     this entity can have it -> cannot fulfill mobility/flexibility."
+    "If LITR is NOT scoped but open to a larger scope -> anyone can request
+     access -> risk."
+
+  KEY IIQ DISTINCTION (this resolves the tension):
+    SCOPE      = controls WHO CAN SEE / MANAGE an object (visibility).
+    ASSIGNMENT = controls WHO ACTUALLY GETS a role (the matcher/rule).
+  These are independent. Do NOT use Scope to control role membership.
+
+  Recommended pattern:  OPEN scope + ENTITY-based ASSIGNMENT.
+    - Role is visible/requestable broadly (mobility preserved).
+    - Auto-assignment matcher gates membership by entity (no uncontrolled grants).
+    - LCM request access can be governed separately by an approval workflow.
+-->
+<sailpoint>
+
+  <!-- ===== OPTION A : ENTITY-SCOPED (locks mobility - the problem) ===== -->
+  <Scope name="BRANCH_A" displayName="Branch A (entity scope)"/>
+  <Scope name="BRANCH_B" displayName="Branch B (entity scope)"/>
+  <Scope name="BRANCH_C" displayName="Branch C (entity scope)"/>
+  <!--
+    If LITR-Employee.assignedScope is set to BRANCH_A, only identities/objects
+    controlled within BRANCH_A scope can see/manage it. A clerk moving from
+    Branch A to Branch B loses visibility. THIS is the mobility breaker.
+    (Left here intentionally so the workshop can SHOW the failure mode.)
+  -->
+
+  <!-- ===== OPTION B : POPULATIONS for assignment-based gating (the fix) ===== -->
+  <!--
+    Instead of scoping the role to an entity, leave the role open and let the
+    ASSIGNMENT matcher decide membership. Populations make the gating visible
+    and reusable in Quicklinks, certifications, and LCM approvals.
+  -->
+  <GroupDefinition name="pop-Branch-Employees" private="false"
+                   displayName="Population - All Branch Employees">
+    <Description>Anyone whose entity is a branch. Drives Employee LITR.</Description>
+    <GroupFilter>
+      <CompositeFilter operation="OR">
+        <Filter operation="EQ" property="entity" value="BRANCH_A"/>
+        <Filter operation="EQ" property="entity" value="BRANCH_B"/>
+        <Filter operation="EQ" property="entity" value="BRANCH_C"/>
+      </CompositeFilter>
+    </GroupFilter>
+  </GroupDefinition>
+
+  <GroupDefinition name="pop-Branch-Managers" private="false"
+                   displayName="Population - Branch Managers">
+    <Description>Branch identities with isManager = Y. Drives Manager LITR.</Description>
+    <GroupFilter>
+      <CompositeFilter operation="AND">
+        <Filter operation="EQ" property="isManager" value="Y"/>
+        <CompositeFilter operation="OR">
+          <Filter operation="EQ" property="entity" value="BRANCH_A"/>
+          <Filter operation="EQ" property="entity" value="BRANCH_B"/>
+          <Filter operation="EQ" property="entity" value="BRANCH_C"/>
+        </CompositeFilter>
+      </CompositeFilter>
+    </GroupFilter>
+  </GroupDefinition>
+
+</sailpoint>
+
+### Demo Guide.md
+
+# Branch Access — IIQ Workshop Prototype
+
+A live, importable demo answering the "Proposed Model – Primary Branch Access"
+whiteboard. **LITR = Location IT Role**, assigned by Enterprise Entity (EE) /
+branch location, and also linkable to a job-function Business Role.
+
+---
+
+## The corrected model: LITR is an IT role with TWO paths onto an identity
+
+| Path | How LITR arrives | IIQ tracks as | Covers |
+|---|---|---|---|
+| **1. Direct (EE)** | LITR's own assignment selector / rule, matches `entity` | **assigned** | everyone in the branch, incl. external EBC users with no job function |
+| **2. Linked (BR)** | a job-function Business Role `requires` the LITR (auto-provisioned) | **required** | identities who get a BR by job function |
+
+The diagram's red arrow (User → Business Role → LITR) is Path 2. The direct
+EE assignment straight onto the identity is Path 1. **Both are modeled on
+purpose** — see the mover demo below for why.
+
+---
+
+## `permits` vs `requires` — why this demo uses `requires`
+
+- **`requires`** → LITR is **auto-provisioned** when the BR lands. No request,
+  no approval. Re-enforced if removed. This is the auto-assignment behaviour.
+- **`permitted`** → LITR becomes *requestable* alongside the BR but is **not**
+  granted automatically. Someone/workflow must still request it.
+
+Auto-assignment was the goal, so the BR **requires** the LITR. The Branch-A
+manager BR shows this statically; `Rule-Link-LITR` shows the scalable variant.
+
+---
+
+## The mover case — the strongest point to make in the room
+
+Marc (Branch A, manager) gets `LITR-Branch-A` by **both** paths at once:
+assigned (EE) + required (via the manager BR).
+
+Now Marc stops being a manager but stays in Branch A:
+- Path 2 (BR `requires`) **drops** — he's no longer a manager.
+- Path 1 (direct EE) **keeps** the LITR — he's still in Branch A.
+
+Net: **Marc keeps his location access across the job change.** Had the LITR
+been modeled BR-only, the mover would strip his branch access — a real gap.
+The dual path *is* the control that keeps location access stable. Demo it live:
+flip `isManager` Y→N for Marc, refresh, show the LITR survives.
+
+---
+
+## One board line to correct before you present
+
+"*Policy is evaluated – based on which the auto assignment rule is triggered.*"
+In IIQ these don't chain: **assignment** decides membership during refresh,
+**policy** (SOD/risk) inspects the result afterward. Policy never triggers
+assignment. (Your notes "assignment = triggering event" and "Manager LITR in
+the same rule as Employee LITR" are correct.)
+
+DB analogy for the room: assignment/role scoping = the `WHERE` clause (narrow
+vs wide predicate); SOD policy = a `CHECK` constraint on the result. Two
+independent things. (No row-security `VIEW` / IIQ Scope object is involved.)
+
+---
+
+## "Scoping" here means ROLE SCOPING, not IIQ Scope objects
+
+The board's mobility-vs-risk debate is about **how narrow or wide the role's
+assignment selector is** — the breadth of the matcher predicate — not about
+IIQ `Scope` objects (visibility / delegated administration). No `Scope` objects
+are in this package on purpose.
+
+| Selector breadth | Control | Mobility |
+|---|---|---|
+| **Narrow** (`entity = BRANCH_A`) | tight | breaks — mover loses the role |
+| **Wide** (`entity IN any branch`) | loose — anyone matching qualifies | preserved |
+| **"Current entity"** (per-branch LITR matched to the identity's live `entity`) | tight | preserved — role follows the person on a move |
+
+The third option dissolves the dilemma: stop treating scoping as a fixed entity
+lock, treat it as "wherever the person currently is." When the EE attribute
+updates on a branch move, the old LITR stops matching and the new one starts —
+no broad predicate, no manual re-request. File 02's per-branch LITRs already
+implement this; file 04 shows narrow vs wide side by side so the room can see
+the failure modes.
+
+---
+
+## Files & import order (IIQ Console: `import <file>`)
+
+1. `01_Application_BranchHR.xml` — set `file.path`, drop the CSV there
+2. `02_Roles_LITR.xml` — LITRs (IT) + job-function Business Roles
+3. `03_Rule_AssignLITR.xml` — direct (Path 1) + linked (Path 2) rules
+4. `04_RoleScoping_Options.xml` — narrow vs wide selector demo (optional)
+
+Then aggregate → Refresh Identity Cube ("Refresh assigned roles" ticked).
+
+---
+
+## Sample data — seeded for the edge cases
+
+| Identity | entity | jobCode | isManager | Demonstrates |
+|---|---|---|---|---|
+| Sophie Dubois | BRANCH_A | CLERK | N | clerk → LITR-A by EE direct + clerk BR |
+| Marc Lefebvre | BRANCH_A | MANAGER | Y | LITR-A by BOTH paths → **mover demo** |
+| Karim Haddad | BRANCH_C | EXTERNAL | N | **external, no job fn** → LITR-C by EE alone |
+| Julie Wouters | BRANCH_A | EXTERNAL | N | second external → LITR-A by EE alone |
+
+---
+
+## Two mechanisms for Path 1 (you asked to see both)
+
+- **Declarative**: the `Selector` on each LITR in file 02.
+- **Scripted**: `Rule-Assign-LITR-Direct` in file 03 — same effect in BeanShell.
+Show both, then recommend declarative for maintainability (no code to review
+per branch); keep BeanShell only where logic exceeds what a matcher expresses.
+
+---
+
+## Live run-of-show (≈15 min)
+
+1. Aggregate + refresh. Show Sophie (LITR via EE), Karim (external, LITR via EE).
+2. Show Marc holds LITR-A by **two** paths (assigned + required in the role detail).
+3. **Mover demo.** Flip Marc isManager Y→N, refresh. LITR-A survives via EE. (peak moment)
+4. **Admin-burden answer.** New branch = one entity value added to `Rule-Link-LITR`
+   / selectors, not a new rule per branch.
+5. **Role scoping** (file 04). Narrow selector breaks the mover; "current entity"
+   scoping (file 02's per-branch LITRs) lets the role follow the person = mobility + control.
+
+---
+
+## Decisions to capture
+
+- [ ] Confirm LITR is auto-assigned via BR `requires` (not `permits`).
+- [ ] Confirm both paths modeled (mover stability) — accept dual-path tracking.
+- [ ] Path 1 mechanism: declarative selector vs BeanShell rule.
+- [ ] Role-scoping breadth: narrow (per-entity) vs wide vs "current entity" (recommended).
+- [ ] Branch resolution for BR link: per-branch BR variants vs one rule (`Rule-Link-LITR`).
+- [ ] `entity` reliably populated for external EBC users in the real source.
+- [ ] Pacific dependency: Manager LITR / Manager PSPA not removable yet.
+- [ ] CPO Board alignment on the auto-assignment mechanism (orange-flag risk).
+
+---
+
+*Demo-grade objects: simplified selectors, no real entitlements on the LITRs.
+Wire to targets before any non-prod promotion.*
