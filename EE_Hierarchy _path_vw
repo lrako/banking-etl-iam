@@ -10,3 +10,53 @@ SELECT
 FROM STG_MASTER_ENTERPRISE_ENTITY
 START WITH PARENT_ROBID IS NULL
 CONNECT BY NOCYCLE PRIOR ROBID = PARENT_ROBID;
+---------
+
+-- Object type for one row of output
+CREATE OR REPLACE TYPE t_ee_child_row AS OBJECT (
+    ROBID         VARCHAR2(16),
+    PARENT_ROBID  VARCHAR2(16),
+    EE_PATH       VARCHAR2(4000),
+    NAME          VARCHAR2(512),
+    DEPTH         NUMBER,
+    IS_LEAF       NUMBER
+);
+/
+CREATE OR REPLACE TYPE t_ee_child_tab AS TABLE OF t_ee_child_row;
+/
+
+CREATE OR REPLACE FUNCTION fn_get_all_children_ee (
+    p_root_robid     IN  VARCHAR2,
+    p_max_depth      IN  NUMBER DEFAULT NULL,   -- NULL = whole subtree; 1 = direct children only
+    p_include_self   IN  VARCHAR2 DEFAULT 'N'   -- 'Y' includes the root node itself
+) RETURN t_ee_child_tab PIPELINED
+IS
+BEGIN
+    FOR r IN (
+        SELECT
+            ROBID,
+            PARENT_ROBID,
+            LTRIM(SYS_CONNECT_BY_PATH(ROBID, ':'), ':') AS EE_PATH,
+            NAME,
+            LEVEL                                       AS DEPTH,
+            CONNECT_BY_ISLEAF                           AS IS_LEAF
+        FROM STG_MASTER_ENTERPRISE_ENTITY
+        START WITH ROBID = p_root_robid
+        CONNECT BY NOCYCLE PRIOR ROBID = PARENT_ROBID
+    ) LOOP
+        -- skip the seed row unless caller wants it
+        IF p_include_self = 'N' AND r.DEPTH = 1 THEN
+            CONTINUE;
+        END IF;
+        -- depth cap: LEVEL 1 = root, so "direct children" = depth <= p_max_depth + 1
+        IF p_max_depth IS NOT NULL AND r.DEPTH > p_max_depth + 1 THEN
+            CONTINUE;
+        END IF;
+
+        PIPE ROW (t_ee_child_row(
+            r.ROBID, r.PARENT_ROBID, r.EE_PATH, r.NAME, r.DEPTH, r.IS_LEAF
+        ));
+    END LOOP;
+    RETURN;
+END fn_get_all_children_ee;
+/
