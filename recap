@@ -1,0 +1,23 @@
+The team reviewed the Segregation of Duties (SOD) policy configuration in SailPoint IdentityIQ, agreeing to use the out-of-the-box interactive policy scheme with subsequent detective review, while keeping role removal logic and global expiration notification settings under assessment. Additional alignment was established around Joiner-Mover-Leaver (JML) processing rules, including user account suspensions, re-organization flags, and multi-mover corner cases.
+Decision Log
+SOD Policy Scheme Configuration: Decided to proceed with the out-of-the-box "interactive" policy scheme in LCM provisioning workflows rather than "fail" or "continue". This triggers an interactive pop-up warning allowing users to submit access requests with violations along with business justification comments.
+SOD Violation Lifecycle: Accepted that after an access request is submitted with a violation, the nightly refresh task will generate a detective policy violation where the designated violation owner can review and set an explicit "allow until" sunset date.
+Non-Personal Accounts Expiration Handling: Confirmed that service and non-personal accounts (such as robots) managed via the Business Modeling Workbench and intermediate database will not receive role deactivation dates or role expiration notifications.
+Mover Notifications: Agreed to update the mover workflow configuration so both the previous line manager and the new line manager are notified when an employee mover event is detected.
+Suspension Administration Permissions: Decided that the User Management (UM) squad will receive a dedicated SailPoint workgroup with limited administrative capabilities rather than full system administrator rights.
+Technical Considerations
+Support Incident on Role Modeling: Cognizant reported an ongoing vendor support incident regarding an issue where intermediate IT roles are missing in user profiles. SailPoint vendor support proposed using permitted roles as a workaround, but it was rejected because it does not fit organizational requirements; a technical follow-up call with the vendor is scheduled for tomorrow.
+Removal of Cascading Permitted Roles: In standard IdentityIQ, optional permitted IT roles assigned at a later time (separately from the parent business role) are not revoked automatically when the business role is removed. The team is evaluating whether to handle revocation via custom plugin logic or a scheduled nightly maintenance task, deferring final resolution to a later call.
+Role Expiration Notifications: Global notification settings in IdentityIQ apply uniformly across all accounts with an end date and only support a single global lead time (e.g., 14 days) addressed out-of-the-box to the requestor and requestee, without standard filtering by user population or target audience.
+JML and Identity Attributes:
+Setting the under_reorg attribute to true prevents automatic mover workflow execution when an enterprise entity changes, requiring subsequent access adjustments to be executed manually.
+Common IT roles are driven by primary and secondary SOU attributes populated via the intermediate database; if an identity has conflicting multi-hop moves across entities within 30 days, manual attribute adjustments in the intermediate database will be utilized rather than introducing complex automated logic.
+On employee termination (leaver), all assigned roles and groups are revoked at Day 15, and the identity is removed from downstream targets at Day 45 while remaining in the authoritative HR source.
+The access request and violation lifecycle follows this sequence:
+<pocket:flowchart title="SOD Access Request and Violation Flow">Request Access -> Detect SOD Violation
+Detect SOD Violation -> Display Interactive Warning
+Display Interactive Warning -> Submit Access with Justification
+Submit Access with Justification -> Provision Access Request
+Provision Access Request -> Run Nightly Refresh Task
+Run Nightly Refresh Task -> Generate Detective Violation
+Generate Detective Violation -> Violation Owner Reviews and Sets Sunset Date</pocket:flowchart>
